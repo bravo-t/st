@@ -166,14 +166,15 @@ static const OptionScheme optionscheme_default = {
 
 	/* more colors can be added after 255 to use with DefaultXX */
 	[256] = "#cbcdd2", // foreground
-	[257] = "#18181b", // background
-	[258] = "#4fb4d8", // cursor
+  [257] = "#4fb4d8", /* reverse cursor */
+	[258] = "#18181b", // background
+	[259] = "#4fb4d8", // cursor
   },
 
 	.defaultfg  = 256,
-	.defaultbg  = 257,
-	.defaultcs  = 258,
-	.defaultrcs = 258,
+	.defaultbg  = 258,
+	.defaultcs  = 259,
+	.defaultrcs = 257,
 };
 
 static const OptionScheme optionscheme_dracula = {
@@ -410,12 +411,17 @@ float alpha_unfocused = 0.96;
  */
 static uint forcemousemod = ShiftMask;
 
+#include "autocomplete.h"
 /*
  * Internal mouse shortcuts.
  * Beware that overloading Button1 will disable the selection.
  */
 static MouseShortcut mshortcuts[] = {
 	/* mask                 button   function        argument             release  altscreen */
+    { Mod1Mask,             Button5, kscrolldown,    {.i = 100},          0,       -1 },
+    { Mod1Mask,             Button4, kscrollup,      {.i = 100},          0,       -1 },
+    { ControlMask,          Button4, kscrollup,      {.i = 10},           0,       -1 },
+    { ControlMask,          Button5, kscrolldown,    {.i = 10},           0,       -1 },
     { XK_ANY_MOD,           Button4, kscrollup,      {.i = 1},            0,       -1 },
     { XK_ANY_MOD,           Button5, kscrolldown,    {.i = 1},            0,       -1 },
 	{ XK_ANY_MOD,           Button2, selpaste,       {.i = 0},            1           },
@@ -447,6 +453,7 @@ static char *cmd_pagehistory[] = { "/bin/sh", "-c",
     ",
 	"externalpipe", NULL };
 
+#define ACMPL_MOD ControlMask|Mod1Mask
 static Shortcut shortcuts[] = {
 	/* mask                 keysym          function        argument */
 	{ XK_ANY_MOD,           XK_Break,       sendbreak,      {.i =  0} },
@@ -471,6 +478,14 @@ static Shortcut shortcuts[] = {
     { TERMMOD,              XK_P,           externalpipe,   {.v = cmd_pagehistory} },
   	{ XK_NO_MOD,            XK_F11,         fullscreen,     {.i =  0} },
   	{ MODKEY,               XK_Return,      fullscreen,     {.i =  0} },
+	{ ACMPL_MOD,            XK_slash,       autocomplete,   { .i = ACMPL_WORD        } },
+	{ ACMPL_MOD,            XK_period,      autocomplete,   { .i = ACMPL_FUZZY_WORD  } },
+	{ ACMPL_MOD,            XK_comma,       autocomplete,   { .i = ACMPL_FUZZY       } },
+	{ ACMPL_MOD,            XK_apostrophe,  autocomplete,   { .i = ACMPL_SUFFIX      } },
+	{ ACMPL_MOD,            XK_semicolon,   autocomplete,   { .i = ACMPL_SURROUND    } },
+	{ ACMPL_MOD,            XK_bracketright,autocomplete,   { .i = ACMPL_WWORD       } },
+	{ ACMPL_MOD,            XK_bracketleft, autocomplete,   { .i = ACMPL_FUZZY_WWORD } },
+	{ ACMPL_MOD,            XK_equal,       autocomplete,   { .i = ACMPL_UNDO        } },
 };
 
 /*
