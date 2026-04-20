@@ -5,7 +5,8 @@
  *
  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
  */
-static char *font = "Meslo LG M DZ:style=Regular:pixelsize=13";
+//static char *font = "Meslo LG M DZ:style=Regular:pixelsize=13";
+static char *font = "DejaVu Sans Mono:size=12";
 static char *sparefonts[] = {
     // Decent icons with comprehensive coverage.
     "Symbols Nerd Font Mono:size=12",
@@ -23,7 +24,7 @@ static char *sparefonts[] = {
     "Unifont:style=Medium:size=13"
 };
 
-static int borderpx = 15;
+static int borderpx = 0;
 
 /*
  * What program is execed by st depends of these precedence rules:
@@ -298,6 +299,8 @@ static Shortcut shortcuts[] = {
     { TERMMOD,              XK_I,           invert,         { }       },
     { TERMMOD,              XK_E,           externalpipe,   {.v = cmd_edithistory} },
     { TERMMOD,              XK_P,           externalpipe,   {.v = cmd_pagehistory} },
+  	{ XK_NO_MOD,            XK_F11,         fullscreen,     {.i =  0} },
+  	{ MODKEY,               XK_Return,      fullscreen,     {.i =  0} },
 };
 
 /*
