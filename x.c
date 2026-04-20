@@ -150,6 +150,9 @@ typedef struct {
 	GC gc;
 } DC;
 
+const OptionScheme *seloptsch = &optionscheme_default;
+static const char *seloptschname = NULL;
+
 static inline ushort sixd_to_16bit(int);
 static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
 static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int, int);
@@ -161,6 +164,7 @@ static void ximinstantiate(Display *, XPointer, XPointer);
 static void ximdestroy(XIM, XPointer, XPointer);
 static int xicdestroy(XIC, XPointer, XPointer);
 static void xinit(int, int);
+static int countoptsch();
 static void cresize(int, int);
 static void xresize(int, int);
 static void xhints(void);
@@ -848,7 +852,7 @@ xloadcolor(int i, const char *name, Color *ncolor)
 			return XftColorAllocValue(xw.dpy, xw.vis,
 			                          xw.cmap, &color, ncolor);
 		} else
-			name = colorname[i];
+			name = seloptsch->colors[i];
 	}
 
 	return XftColorAllocName(xw.dpy, xw.vis, xw.cmap, name, ncolor);
@@ -880,14 +884,14 @@ xloadcols(void)
 		for (cp = dc.col; cp < &dc.col[dc.collen]; ++cp)
 			XftColorFree(xw.dpy, xw.vis, xw.cmap, cp);
 	} else {
-		dc.collen = MAX(LEN(colorname), 256);
+		dc.collen = MAX(LEN(seloptsch->colors), 256);
 		dc.col = xmalloc(dc.collen * sizeof(Color));
 	}
 
 	for (i = 0; i < dc.collen; i++)
 		if (!xloadcolor(i, NULL, &dc.col[i])) {
-			if (colorname[i])
-				die("could not allocate color '%s'\n", colorname[i]);
+			if (seloptsch->colors[i])
+				die("could not allocate color '%s'\n", seloptsch->colors[i]);
 			else
 				die("could not allocate color %d\n", i);
 		}
@@ -933,7 +937,7 @@ void
 xclear(int x1, int y1, int x2, int y2)
 {
     Color c;
-    c = dc.col[IS_SET(MODE_REVERSE)? defaultfg : defaultbg];
+    c = dc.col[IS_SET(MODE_REVERSE)? seloptsch->defaultfg : seloptsch->defaultbg];
     if (invertcolors) {
         c = invertedcolor(&c);
     }
@@ -1306,6 +1310,15 @@ xicdestroy(XIC xim, XPointer client, XPointer call)
 	return 1;
 }
 
+int
+countoptsch()
+{ 
+	int i, optsch_limit = 256;
+	for(i = 0; optionschemes[i] != NULL && i < optsch_limit; i++)
+		;
+	return i;
+}
+
 void
 xinit(int cols, int rows)
 {
@@ -1343,6 +1356,15 @@ xinit(int cols, int rows)
     xloadsparefonts();
 
 	/* colors */
+	if (seloptschname) {
+		int optschcount = countoptsch();
+		for (int i = 0; optionschemes[i] && i < optschcount; i++) {
+			if (strcmp(optionschemes[i]->name, seloptschname) == 0) {
+				seloptsch = optionschemes[i];
+				break;
+			}
+		}
+	}
     xw.cmap = XCreateColormap(xw.dpy, parent, xw.vis, None);
 	xloadcols();
 
@@ -1355,8 +1377,8 @@ xinit(int cols, int rows)
 		xw.t += DisplayHeight(xw.dpy, xw.scr) - win.h - 2;
 
 	/* Events */
-	xw.attrs.background_pixel = dc.col[defaultbg].pixel;
-	xw.attrs.border_pixel = dc.col[defaultbg].pixel;
+	xw.attrs.background_pixel = dc.col[seloptsch->defaultbg].pixel;
+	xw.attrs.border_pixel = dc.col[seloptsch->defaultbg].pixel;
 	xw.attrs.bit_gravity = NorthWestGravity;
 	xw.attrs.event_mask = FocusChangeMask | KeyPressMask | KeyReleaseMask
 		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
@@ -1377,7 +1399,7 @@ xinit(int cols, int rows)
 	gcvalues.graphics_exposures = False;
     xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h, xw.depth);
     dc.gc = XCreateGC(xw.dpy, xw.buf, GCGraphicsExposures, &gcvalues);
-	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
+	XSetForeground(xw.dpy, dc.gc, dc.col[seloptsch->defaultbg].pixel);
 	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
 
 	/* font spec buffer */
@@ -1396,13 +1418,13 @@ xinit(int cols, int rows)
 	cursor = XCreateFontCursor(xw.dpy, mouseshape);
 	XDefineCursor(xw.dpy, xw.win, cursor);
 
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
+	if (XParseColor(xw.dpy, xw.cmap, seloptsch->colors[mousefg], &xmousefg) == 0) {
 		xmousefg.red   = 0xffff;
 		xmousefg.green = 0xffff;
 		xmousefg.blue  = 0xffff;
 	}
 
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousebg], &xmousebg) == 0) {
+	if (XParseColor(xw.dpy, xw.cmap, seloptsch->colors[mousebg], &xmousebg) == 0) {
 		xmousebg.red   = 0x0000;
 		xmousebg.green = 0x0000;
 		xmousebg.blue  = 0x0000;
@@ -1629,8 +1651,8 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 		fg = &dc.col[base.fg + 8];
 
 	if (IS_SET(MODE_REVERSE)) {
-		if (fg == &dc.col[defaultfg]) {
-			fg = &dc.col[defaultbg];
+		if (fg == &dc.col[seloptsch->defaultfg]) {
+			fg = &dc.col[seloptsch->defaultbg];
 		} else {
 			colfg.red = ~fg->color.red;
 			colfg.green = ~fg->color.green;
@@ -1641,8 +1663,8 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 			fg = &revfg;
 		}
 
-		if (bg == &dc.col[defaultbg]) {
-			bg = &dc.col[defaultfg];
+		if (bg == &dc.col[seloptsch->defaultbg]) {
+			bg = &dc.col[seloptsch->defaultfg];
 		} else {
 			colbg.red = ~bg->color.red;
 			colbg.green = ~bg->color.green;
@@ -1765,21 +1787,21 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 
 	if (IS_SET(MODE_REVERSE)) {
 		g.mode |= ATTR_REVERSE;
-		g.bg = defaultfg;
+		g.bg = seloptsch->defaultfg;
 		if (selected(cx, cy)) {
-			drawcol = dc.col[defaultcs];
-			g.fg = defaultrcs;
+			drawcol = dc.col[seloptsch->defaultcs];
+			g.fg = seloptsch->defaultrcs;
 		} else {
-			drawcol = dc.col[defaultrcs];
-			g.fg = defaultcs;
+			drawcol = dc.col[seloptsch->defaultrcs];
+			g.fg = seloptsch->defaultcs;
 		}
 	} else {
 		if (selected(cx, cy)) {
-			g.fg = defaultfg;
-			g.bg = defaultrcs;
+			g.fg = seloptsch->defaultfg;
+			g.bg = seloptsch->defaultrcs;
 		} else {
-			g.fg = defaultbg;
-			g.bg = defaultcs;
+			g.fg = seloptsch->defaultfg;
+			g.bg = seloptsch->defaultrcs;
 		}
 		drawcol = dc.col[g.bg];
 	}
@@ -1953,7 +1975,7 @@ xfinishdraw(void)
 			win.h, 0, 0);
 	XSetForeground(xw.dpy, dc.gc,
 			dc.col[IS_SET(MODE_REVERSE)?
-				defaultfg : defaultbg].pixel);
+				seloptsch->defaultfg : seloptsch->defaultbg].pixel);
 }
 
 void
@@ -2313,11 +2335,11 @@ run(void)
 void
 usage(void)
 {
-	die("usage: %s [-aiv] [-c class] [-f font] [-g geometry]"
+	die("usage: %s [-aiv] [-S colorscheme] [-c class] [-f font] [-g geometry]"
 	    " [-n name] [-o file]\n"
 	    "          [-T title] [-t title] [-w windowid]"
 	    " [[-e] command [args ...]]\n"
-	    "       %s [-aiv] [-c class] [-f font] [-g geometry]"
+	    "       %s [-aiv] [-S colorscheme] [-c class] [-f font] [-g geometry]"
 	    " [-n name] [-o file]\n"
 	    "          [-T title] [-t title] [-w windowid] -l line"
 	    " [stty_args ...]\n", argv0, argv0);
@@ -2376,6 +2398,9 @@ main(int argc, char *argv[])
 		break;
 	case 'v':
 		die("%s " VERSION "\n", argv0);
+		break;
+	case 'S':
+		seloptschname = EARGF(usage());
 		break;
 	default:
 		usage();

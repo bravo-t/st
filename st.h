@@ -66,6 +66,15 @@ typedef unsigned short ushort;
 
 typedef uint_least32_t Rune;
 
+typedef struct {
+	const char *name;
+	const char *colors[260];
+	unsigned int defaultfg;
+	unsigned int defaultbg;
+	unsigned int defaultcs;
+	unsigned int defaultrcs;
+} OptionScheme;
+
 #define Glyph Glyph_
 typedef struct {
 	Rune u;           /* character code */
@@ -143,9 +152,7 @@ extern int allowaltscreen;
 extern int allowwindowops;
 extern char *termname;
 extern unsigned int tabspaces;
-extern unsigned int defaultfg;
-extern unsigned int defaultbg;
+extern const OptionScheme *seloptsch;
 extern float alpha;
 extern float alpha_unfocused;
 extern const int boxdraw, boxdraw_bold, boxdraw_braille;
-extern unsigned int defaultcs;

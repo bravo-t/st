@@ -1078,8 +1078,8 @@ treset(void)
 
 	term.c = (TCursor){{
 		.mode = ATTR_NULL,
-		.fg = defaultfg,
-		.bg = defaultbg
+		.fg = seloptsch->defaultfg,
+		.bg = seloptsch->defaultbg
 	}, .x = 0, .y = 0, .state = CURSOR_DEFAULT};
 
 	memset(term.tabs, 0, term.col * sizeof(*term.tabs));
@@ -1102,7 +1102,7 @@ treset(void)
 void
 tnew(int col, int row)
 {
-	term = (Term){ .c = { .attr = { .fg = defaultfg, .bg = defaultbg } } };
+	term = (Term){ .c = { .attr = { .fg = seloptsch->defaultfg, .bg = seloptsch->defaultbg } } };
 	tresize(col, row);
 	treset();
 }
@@ -1512,8 +1512,8 @@ tsetattr(const int *attr, int l)
 				ATTR_REVERSE    |
 				ATTR_INVISIBLE  |
 				ATTR_STRUCK     );
-			term.c.attr.fg = defaultfg;
-			term.c.attr.bg = defaultbg;
+			term.c.attr.fg = seloptsch->defaultfg;
+			term.c.attr.bg = seloptsch->defaultbg;
 			break;
 		case 1:
 			term.c.attr.mode |= ATTR_BOLD;
@@ -1567,14 +1567,14 @@ tsetattr(const int *attr, int l)
 				term.c.attr.fg = idx;
 			break;
 		case 39:
-			term.c.attr.fg = defaultfg;
+			term.c.attr.fg = seloptsch->defaultfg;
 			break;
 		case 48:
 			if ((idx = tdefcolor(attr, &i, l)) >= 0)
 				term.c.attr.bg = idx;
 			break;
 		case 49:
-			term.c.attr.bg = defaultbg;
+			term.c.attr.bg = seloptsch->defaultbg;
 			break;
 		default:
 			if (BETWEEN(attr[i], 30, 37)) {
@@ -2050,9 +2050,9 @@ strhandle(void)
 	char *p = NULL, *dec;
 	int j, narg, par;
 	const struct { int idx; char *str; } osc_table[] = {
-		{ defaultfg, "foreground" },
-		{ defaultbg, "background" },
-		{ defaultcs, "cursor" }
+		{ seloptsch->defaultfg, "foreground" },
+		{ seloptsch->defaultbg, "background" },
+		{ seloptsch->defaultcs, "cursor" }
 	};
 
 	term.esc &= ~(ESC_STR_END|ESC_STR);

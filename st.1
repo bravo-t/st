@@ -4,6 +4,8 @@ st \- simple terminal
 .SH SYNOPSIS
 .B st
 .RB [ \-aiv ]
+.RB [ \-S
+.IR colorscheme ]
 .RB [ \-c
 .IR class ]
 .RB [ \-f
@@ -28,6 +30,8 @@ st \- simple terminal
 .PP
 .B st
 .RB [ \-aiv ]
+.RB [ \-S
+.IR colorscheme ]
 .RB [ \-c
 .IR class ]
 .RB [ \-f
@@ -54,6 +58,22 @@ is a simple terminal emulator.
 .TP
 .B \-a
 disable alternate screens in terminal
+.TP
+.BI \-S " scheme"
+Sets the terminal color scheme.
+The following schemes are supported:
+.BR default ,
+.BR light ,
+.BR plan9 ,
+.BR dracula ,
+.BR solarized ,
+.BR nord ,
+.BR gruvbox ,
+and
+.BR cyberpunk .
+If no scheme is specified, or if an unknown scheme is given,
+.B default
+is used.
 .TP
 .BI \-c " class"
 defines the window class (default $TERM).

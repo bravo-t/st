@@ -143,8 +143,9 @@ char *termname = "st-256color";
  */
 unsigned int tabspaces = 4;
 
-/* an-old-hope colors (first 16 used by escape sequences) */
-static const char *colorname[] = {
+static const OptionScheme optionscheme_default = {
+	.name = "default",
+	.colors = {
 	"#3b3d45", /* black */
 	"#eb3d54", /* red */
 	"#78bd65", /* green */
@@ -167,11 +168,180 @@ static const char *colorname[] = {
 	[256] = "#cbcdd2", // foreground
 	[257] = "#18181b", // background
 	[258] = "#4fb4d8", // cursor
+  },
 
-	"#cccccc",
-	"#555555",
-	"gray90", /* default foreground colour */
-	"black", /* default background colour */
+	.defaultfg  = 256,
+	.defaultbg  = 257,
+	.defaultcs  = 258,
+	.defaultrcs = 258,
+};
+
+static const OptionScheme optionscheme_dracula = {
+    .name = "monokai",
+    .colors = {
+        /* 8 normal */
+        [0] = "#282a3a", [1] = "#ff657a", [2] = "#bad761", [3] = "#ffd76d",
+        [4] = "#ff9b5e", [5] = "#c39ac9", [6] = "#9cd1bb", [7] = "#eaf2f1",
+        /* 8 bright */
+        [8] =  "#696d77", [9] =  "#ff657a", [10] = "#bad761", [11] = "#ffd76d",
+        [12] = "#ff9b5e", [13] = "#c39ac9", [14] = "#9cd1bb", [15] = "#eaf2f1",
+
+        [255] = 0,
+
+        /* DefaultXX */
+        [256] = "#b2b9bd", /* cursor */
+        [257] = "#44475a", /* reverse cursor */
+        [258] = "#eaf2f1", /* fg */
+        [259] = "#282a3a"  /* bg */
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 256
+};
+
+static const OptionScheme optionscheme_solarized = {
+    .name = "solarized",
+    .colors = {
+        /* 8 normal colors */
+        [0] = "#002b36", [1] = "#dc322f", [2] = "#859900", [3] = "#b58900",
+        [4] = "#268bd2", [5] = "#6c71c4", [6] = "#2aa198", [7] = "#93a1a1",
+        /* 8 bright colors */
+        [8] = "#657b83", [9] = "#dc322f", [10] = "#859900", [11] = "#b58900",
+        [12] = "#268bd2", [13] = "#6c71c4", [14] = "#2aa198", [15] = "#fdf6e3",
+
+        [255] = 0,
+
+        /* DefaultXX */
+        [256] = "#839496", [257] = "#002b36", [258] = "#839496", [259] = "#002b36"
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 257
+};
+
+static const OptionScheme optionscheme_nord = {
+    .name = "nord",
+    .colors = {
+        /* 8 normal */
+        [0] = "#3b4252", [1] = "#bf616a", [2] = "#a3be8c", [3] = "#ebcb8b",
+        [4] = "#81a1c1", [5] = "#b48ead", [6] = "#88c0d0", [7] = "#e5e9f0",
+        /* 8 bright */
+        [8] = "#4c566a", [9] = "#bf616a", [10] = "#a3be8c", [11] = "#ebcb8b",
+        [12] = "#81a1c1", [13] = "#b48ead", [14] = "#8fbcbb", [15] = "#eceff4",
+
+        [255] = 0,
+
+        /* DefaultXX */
+        [256] = "#d8dee9", [257] = "#2e3440", [258] = "#d8dee9", [259] = "#2e3440"
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 257
+};
+
+static const OptionScheme optionscheme_gruvbox = {
+    .name = "gruvbox",
+    .colors = {
+        /* 8 normal */
+        [0] = "#282828", [1] = "#cc241d", [2] = "#98971a", [3] = "#d79921",
+        [4] = "#458588", [5] = "#b16286", [6] = "#689d6a", [7] = "#a89984",
+        /* 8 bright */
+        [8] = "#928374", [9] = "#fb4934", [10] = "#b8bb26", [11] = "#fabd2f",
+        [12] = "#83a598", [13] = "#d3869b", [14] = "#8ec07c", [15] = "#ebdbb2",
+
+        [255] = 0,
+
+        /* DefaultXX */
+        [256] = "#ebdbb2", [257] = "#282828", [258] = "#ebdbb2", [259] = "#282828"
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 257
+};
+
+static const OptionScheme optionscheme_plan9 = {
+    .name = "plan9",
+    .colors = {
+        /* 8 normal colors */
+        [0] = "#000000", [1] = "#9c0000", [2] = "#008000", [3] = "#999900",
+        [4] = "#00009c", [5] = "#990099", [6] = "#009999", [7] = "#7f7f7f",
+        /* 8 bright colors */
+        [8] = "#c0c0c0", [9] = "#ff0000", [10] = "#00ff00", [11] = "#ffff00",
+        [12] = "#5c5cff", [13] = "#ff00ff", [14] = "#00ffff", [15] = "#ffffff",
+
+        [255] = 0,
+
+        /* DefaultXX colors */
+        [256] = "#000000", [257] = "#9ecfff", [258] = "#000000", [259] = "#ffffea"
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 257
+};
+
+static const OptionScheme optionscheme_cyberpunk = {
+    .name = "cyberpunk",
+    .colors = {
+        /* 8 normal */
+        [0] = "#0d0221", [1] = "#ff004d", [2] = "#00ff9f", [3] = "#fffa72",
+        [4] = "#00caff", [5] = "#ff00ff", [6] = "#0affef", [7] = "#a0a0a0",
+        /* 8 bright */
+        [8] = "#3a0f5c", [9] = "#ff4d79", [10] = "#4dffb8", [11] = "#fffaa0",
+        [12] = "#4dd2ff", [13] = "#ff4dff", [14] = "#4df9ff", [15] = "#ffffff",
+
+        [255] = 0,
+
+        /* DefaultXX */
+        [256] = "#00ffcc", [257] = "#0d0221", [258] = "#00ffcc", [259] = "#0d0221"
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 257
+};
+
+static const OptionScheme optionscheme_light = {
+    .name = "light",
+    .colors = {
+        /* 8 normal colors */
+        [0] = "#000000", [1] = "#d70000", [2] = "#008700", [3] = "#af8700",
+        [4] = "#005faf", [5] = "#8700af", [6] = "#00afaf", [7] = "#d0d0d0",
+        /* 8 bright colors */
+        [8] = "#808080", [9] = "#ff0000", [10] = "#00ff00", [11] = "#ffff00",
+        [12] = "#5c5cff", [13] = "#ff00ff", [14] = "#00ffff", [15] = "#ffffff",
+
+        [255] = 0,
+
+        /* DefaultXX colors */
+        [256] = "#000000", [257] = "#4a90e2", [258] = "#000000", [259] = "#eeeeee"
+    },
+    .defaultfg = 258,
+    .defaultbg = 259,
+    .defaultcs = 256,
+    .defaultrcs = 257
+};
+
+/*
+ * you can move the schemes to a different header and do #include "optionschemes.h"
+ * or you can move each scheme to its own file
+ * and do #include optionscheme_light.h, #include optionscheme_plan9.h, ...
+ * */
+
+static const OptionScheme *optionschemes[] = {
+    &optionscheme_default,
+    &optionscheme_light,
+    &optionscheme_plan9,
+    &optionscheme_dracula,
+    &optionscheme_solarized,
+    &optionscheme_nord,
+    &optionscheme_gruvbox,
+    &optionscheme_cyberpunk,
+    NULL /* has to be NULL terminated */
 };
 
 /*
