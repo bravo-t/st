@@ -1170,8 +1170,15 @@ kscrollup(const Arg* a)
 	if (n < 0)
 		n = term.row + n;
 
-	if (term.scr < term.histwcount && \
-        term.scr <= HISTSIZE-n) {
+	/*
+	 * History lines are now allocated lazily, so we must never scroll past
+	 * the number of lines actually written - those slots would be NULL.
+	 * Clamp n to the available history instead of the full HISTSIZE.
+	 */
+	if (n > term.histwcount - term.scr)
+		n = term.histwcount - term.scr;
+
+	if (n > 0) {
 		term.scr += n;
 		selscroll(0, n);
 		tfulldirt();
@@ -1189,6 +1196,9 @@ tscrolldown(int orig, int n, int copyhist)
     if (copyhist) {
         term.histi = (term.histi - 1 + HISTSIZE) % HISTSIZE;
         temp = term.hist[term.histi];
+        /* history lines are allocated lazily; create one on first use */
+        if (!temp)
+            temp = xmalloc(term.col * sizeof(Glyph));
         term.hist[term.histi] = term.line[term.bot];
         term.line[term.bot] = temp;
     }
@@ -1216,6 +1226,9 @@ tscrollup(int orig, int n, int copyhist)
     if (copyhist) {
         term.histi = (term.histi + 1) % HISTSIZE;
         temp = term.hist[term.histi];
+        /* history lines are allocated lazily; create one on first use */
+        if (!temp)
+            temp = xmalloc(term.col * sizeof(Glyph));
         term.hist[term.histi] = term.line[orig];
         term.line[orig] = temp;
 
@@ -2207,6 +2220,9 @@ externalpipe(const Arg *arg)
    newline = 0;
    for (n = 0; n <= HISTSIZE + 2; n++) {
        bp = TLINE_HIST(n);
+       /* skip history lines that were never written (lazily allocated) */
+       if (!bp)
+           continue;
        lastpos = MIN(tlinehistlen(n) + 1, term.col) - 1;
        if (lastpos < 0)
            break;
@@ -2827,7 +2843,14 @@ tresize(int col, int row)
 	term.dirty = xrealloc(term.dirty, row * sizeof(*term.dirty));
 	term.tabs = xrealloc(term.tabs, col * sizeof(*term.tabs));
 
+    /*
+     * History lines are allocated lazily as the scrollback fills, so only
+     * lines that already exist need to be resized; the rest stay NULL until
+     * they are first written.
+     */
     for (i = 0; i < HISTSIZE; i++) {
+        if (!term.hist[i])
+            continue;
         term.hist[i] = xrealloc(term.hist[i], col * sizeof(Glyph));
         for (j = mincol; j < col; j++) {
             term.hist[i][j] = term.c.attr;
