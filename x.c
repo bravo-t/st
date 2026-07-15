@@ -2171,6 +2171,7 @@ kpress(XEvent *ev)
 
 	/* 2. custom keys from config.h */
 	if ((customkey = kmap(ksym, e->state))) {
+		kscrolldown(&((Arg){ .i = INT_MAX }));
 		ttywrite(customkey, strlen(customkey), 1);
 		return;
 	}
@@ -2190,6 +2191,7 @@ kpress(XEvent *ev)
 			len = 2;
 		}
 	}
+	kscrolldown(&((Arg){ .i = INT_MAX }));
 	ttywrite(buf, len, 1);
 }
 

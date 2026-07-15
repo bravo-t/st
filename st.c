@@ -905,9 +905,6 @@ void
 ttywrite(const char *s, size_t n, int may_echo)
 {
 	const char *next;
-    Arg arg = (Arg) { .i = term.scr };
-
-    kscrolldown(&arg);
 
 	if (may_echo && IS_SET(MODE_ECHO))
 		twrite(s, n, 1);
@@ -1724,6 +1721,13 @@ tsetmode(int priv, int set, const int *args, int narg)
 				      and can be mistaken for other control
 				      codes. */
 				break;
+      case 2026:
+ 	      if (set) {
+ 		      tsync_begin();
+ 	      } else {
+ 		      tsync_end();
+ 	      }
+ 	      break;
 			default:
 				fprintf(stderr,
 					"erresc: unknown private set/reset mode %d\n",
