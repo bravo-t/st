@@ -1319,6 +1319,25 @@ countoptsch()
 	return i;
 }
 
+static int
+xerror(Display *dpy, XErrorEvent *e)
+{
+	char buf[256];
+
+	/*
+	 * Non-fatal protocol errors (notably BadLength from
+	 * RenderAddGlyphs, produced by buggy libXft when uploading an
+	 * oversized/color glyph) would otherwise reach Xlib's default
+	 * handler, which calls exit(). Log and continue so that a single
+	 * bad glyph cannot take down the whole terminal.
+	 */
+	XGetErrorText(dpy, e->error_code, buf, sizeof(buf));
+	fprintf(stderr, "st: ignoring X error: %s "
+		"(request %d.%d, serial %lu)\n",
+		buf, e->request_code, e->minor_code, e->serial);
+	return 0;
+}
+
 void
 xinit(int cols, int rows)
 {
@@ -1332,6 +1351,7 @@ xinit(int cols, int rows)
 
 	if (!(xw.dpy = XOpenDisplay(NULL)))
 		die("can't open display\n");
+	XSetErrorHandler(xerror);
 	xw.scr = XDefaultScreen(xw.dpy);
 
     if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0)))) {
@@ -1563,6 +1583,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 			FcPatternAddCharSet(fcpattern, FC_CHARSET,
 					fccharset);
 			FcPatternAddBool(fcpattern, FC_SCALABLE, 1);
+			FcPatternAddBool(fcpattern, FC_COLOR, FcFalse);
 
 			FcConfigSubstitute(0, fcpattern,
 					FcMatchPattern);
@@ -1592,6 +1613,21 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 
 			FcPatternDestroy(fcpattern);
 			FcCharSetDestroy(fccharset);
+		}
+
+		/*
+		 * libXft (< 2.3.5) can crash with BadLength in
+		 * RenderAddGlyphs when uploading color/BGRA glyphs. Skip
+		 * such fallback fonts (leaving the cell blank) instead of
+		 * risking the crash.
+		 */
+		if (frc[f].font) {
+			FcBool iscol;
+			if (FcPatternGetBool(frc[f].font->pattern, FC_COLOR,
+					0, &iscol) == FcResultMatch && iscol) {
+				xp += runewidth;
+				continue;
+			}
 		}
 
 		specs[numspecs].font = frc[f].font;
