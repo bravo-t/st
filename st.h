@@ -137,10 +137,12 @@ char *xstrdup(const char *);
 
 int isboxdraw(Rune);
 ushort boxdrawindex(const Glyph *);
+extern const unsigned short *const boxdraw_lut;
 #ifdef XFT_VERSION
 /* only exposed to x.c, otherwise we'll need Xft.h for the types */
 void boxdraw_xinit(Display *, Colormap, XftDraw *, Visual *);
 void drawboxes(int, int, int, int, XftColor *, XftColor *, const XftGlyphFontSpec *, int);
+void drawboxes_at(int, int, int, XftColor *, XftColor *, const XftGlyphFontSpec *, int);
 #endif
 int xgetcolor(int x, unsigned char *r, unsigned char *g, unsigned char *b);
 
@@ -158,3 +160,11 @@ extern const OptionScheme *seloptsch;
 extern float alpha;
 extern float alpha_unfocused;
 extern const int boxdraw, boxdraw_bold, boxdraw_braille;
+
+static inline int
+isboxdraw_fast(Rune u)
+{
+	Rune block = u & ~0xffu;
+	return (boxdraw && block == 0x2500 && boxdraw_lut[(uint8_t)u]) ||
+	       (boxdraw_braille && block == 0x2800);
+}
