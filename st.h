@@ -119,6 +119,8 @@ int ttynew(const char *, char *, const char *, char **);
 size_t ttyread(void);
 void ttyresize(int, int);
 void ttywrite(const char *, size_t, int);
+int ttywrite_pending(void);
+void ttywrite_flush(void);
 
 void resettitle(void);
 

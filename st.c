@@ -257,6 +257,10 @@ static STREscape strescseq;
 static int iofd = 1;
 static int cmdfd;
 static pid_t pid;
+static char *ttywbuf = NULL;
+static size_t ttywhead = 0;
+static size_t ttywtail = 0;
+static size_t ttywcap = 0;
 static HistSlab *histslab_head = NULL;
 static HistSlab *histslab_cur = NULL;
 static HistSlab *histslab_spare = NULL;
@@ -791,26 +795,19 @@ execsh(char *cmd, char **args)
 void
 sigchld(int a)
 {
+	int saved_errno = errno;
 	int stat;
 	pid_t p;
 
-	if ((p = waitpid(pid, &stat, WNOHANG)) < 0)
-		die("waiting for pid %hd failed: %s\n", pid, strerror(errno));
-
-	if (pid != p) {
-        if (p == 0 && wait(&stat) < 0)
-            die("wait: %s\n", strerror(errno));
-
-        /* reinstall sigchld handler */
-        signal(SIGCHLD, sigchld);
-		return;
-    }
-
-	if (WIFEXITED(stat) && WEXITSTATUS(stat))
-		die("child exited with status %d\n", WEXITSTATUS(stat));
-	else if (WIFSIGNALED(stat))
-		die("child terminated due to signal %d\n", WTERMSIG(stat));
-	_exit(0);
+	/* Reap all exited children without ever blocking or calling stdio. */
+	while ((p = waitpid(-1, &stat, WNOHANG)) > 0) {
+		if (p == pid) {
+			if (WIFEXITED(stat))
+				_exit(WEXITSTATUS(stat));
+			_exit(1);
+		}
+	}
+	errno = saved_errno;
 }
 
 void
@@ -858,6 +855,9 @@ ttynew(const char *line, char *cmd, const char *out, char **args)
 			    line, strerror(errno));
 		dup2(cmdfd, 0);
 		stty(args);
+		int fl = fcntl(cmdfd, F_GETFL, 0);
+		if (fl >= 0)
+			fcntl(cmdfd, F_SETFL, fl | O_NONBLOCK);
 		return cmdfd;
 	}
 
@@ -893,7 +893,19 @@ ttynew(const char *line, char *cmd, const char *out, char **args)
 #endif
 		close(s);
 		cmdfd = m;
-		signal(SIGCHLD, sigchld);
+		{
+			int fl = fcntl(cmdfd, F_GETFL, 0);
+			if (fl >= 0)
+				fcntl(cmdfd, F_SETFL, fl | O_NONBLOCK);
+		}
+		{
+			struct sigaction sa;
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = sigchld;
+			sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+			sigemptyset(&sa.sa_mask);
+			sigaction(SIGCHLD, &sa, NULL);
+		}
 		break;
 	}
 	return cmdfd;
@@ -919,6 +931,8 @@ ttyread(void)
 		case 0:
 			exit(0);
 		case -1:
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+				break;
 			die("couldn't read from shell: %s\n", strerror(errno));
 		default:
 			buflen += ret;
@@ -979,61 +993,104 @@ ttywrite(const char *s, size_t n, int may_echo)
 	}
 }
 
+int
+ttywrite_pending(void)
+{
+	return ttywtail > ttywhead;
+}
+
+/*
+ * Drain queued PTY writes without blocking the X11 event loop. Stops if the
+ * PTY input buffer is full (or after 64 KB per turn so X11/reads stay live).
+ */
+void
+ttywrite_flush(void)
+{
+	size_t budget = 65536;
+
+	while (ttywtail > ttywhead && budget > 0) {
+		struct pollfd pfd = { .fd = cmdfd, .events = POLLOUT };
+		ssize_t r;
+		size_t avail = ttywtail - ttywhead;
+		size_t chunk = MIN(avail, MIN(budget, (size_t)4096));
+
+		if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLOUT))
+			break;
+		r = write(cmdfd, ttywbuf + ttywhead, chunk);
+		if (r < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+				break;
+			die("write error on tty: %s\n", strerror(errno));
+		}
+		if (r == 0)
+			break;
+		ttywhead += (size_t)r;
+		budget -= (size_t)r;
+	}
+
+	if (ttywhead == ttywtail) {
+		ttywhead = ttywtail = 0;
+		if (ttywcap > 65536) {
+			free(ttywbuf);
+			ttywbuf = NULL;
+			ttywcap = 0;
+		}
+	} else if (ttywhead >= 4096 && ttywhead * 2 >= ttywcap) {
+		size_t rem = ttywtail - ttywhead;
+		memmove(ttywbuf, ttywbuf + ttywhead, rem);
+		ttywhead = 0;
+		ttywtail = rem;
+	}
+}
+
 void
 ttywriteraw(const char *s, size_t n)
 {
-	fd_set wfd, rfd;
-	ssize_t r;
-	size_t lim = 4096;
+	if (n == 0)
+		return;
 
-	/*
-	 * Remember that we are using a pty, which might be a modem line.
-	 * Writing too much will clog the line. That's why we are doing this
-	 * dance.
-	 * FIXME: Migrate the world to Plan 9.
-	 */
-	while (n > 0) {
-		FD_ZERO(&wfd);
-		FD_ZERO(&rfd);
-		FD_SET(cmdfd, &wfd);
-		FD_SET(cmdfd, &rfd);
-
-		/* Check if we can write. */
-		if (pselect(cmdfd+1, &rfd, &wfd, NULL, NULL, NULL) < 0) {
-			if (errno == EINTR)
-				continue;
-			die("select failed: %s\n", strerror(errno));
-		}
-		if (FD_ISSET(cmdfd, &wfd)) {
-			/*
-			 * Only write the bytes written by ttywrite() or the
-			 * default of 256. This seems to be a reasonable value
-			 * for a serial line. Bigger values might clog the I/O.
-			 */
-			if ((r = write(cmdfd, s, (n < lim)? n : lim)) < 0)
-				goto write_error;
-			if (r < n) {
-				/*
-				 * We weren't able to write out everything.
-				 * This means the buffer is getting full
-				 * again. Empty it.
-				 */
-				if (n < lim)
-					lim = ttyread();
-				n -= r;
-				s += r;
-			} else {
-				/* All bytes have been written. */
+	/* Fast path: when nothing is queued and PTY is writable, write directly. */
+	if (ttywtail == ttywhead) {
+		size_t budget = 65536;
+		while (n > 0 && budget > 0) {
+			struct pollfd pfd = { .fd = cmdfd, .events = POLLOUT };
+			ssize_t r;
+			size_t chunk = MIN(n, MIN(budget, (size_t)4096));
+			if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLOUT))
 				break;
+			r = write(cmdfd, s, chunk);
+			if (r < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+					break;
+				die("write error on tty: %s\n", strerror(errno));
 			}
+			if (r == 0)
+				break;
+			s += r;
+			n -= (size_t)r;
+			budget -= (size_t)r;
 		}
-		if (FD_ISSET(cmdfd, &rfd))
-			lim = ttyread();
+		if (n == 0)
+			return;
 	}
-	return;
 
-write_error:
-	die("write error on tty: %s\n", strerror(errno));
+	/* Queue remaining bytes to be drained by run()'s pselect() loop. */
+	if (ttywhead > 0 && ttywtail + n > ttywcap) {
+		size_t rem = ttywtail - ttywhead;
+		memmove(ttywbuf, ttywbuf + ttywhead, rem);
+		ttywhead = 0;
+		ttywtail = rem;
+	}
+	if (ttywtail + n > ttywcap) {
+		size_t newcap = ttywcap ? ttywcap * 2 : 4096;
+		while (newcap < ttywtail + n)
+			newcap *= 2;
+		ttywbuf = xrealloc(ttywbuf, newcap);
+		ttywcap = newcap;
+	}
+	memcpy(ttywbuf + ttywtail, s, n);
+	ttywtail += n;
+	ttywrite_flush();
 }
 
 void

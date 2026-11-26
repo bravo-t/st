@@ -3,6 +3,7 @@
 #include <math.h>
 #include <limits.h>
 #include <locale.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <sys/select.h>
@@ -302,6 +303,7 @@ static int prev_cy = 0;
 static int cursor_dirty = 0;
 static int xneeddraw = 0;
 static int win_urgent = 0;
+static int is_etx = 0;
 static int dirty_x1 = 0, dirty_y1 = 0, dirty_x2 = 0, dirty_y2 = 0;
 #define MAX_DIRTY_RECTS 64
 static XRectangle dirty_rects[MAX_DIRTY_RECTS];
@@ -1572,6 +1574,7 @@ xsetpacing(void)
 	if (xisetx()) {
 		maxlatency = etxmaxlatency;
 		xfps = etxxfps;
+		is_etx = 1;
 	}
 }
 
@@ -3093,8 +3096,11 @@ void
 visibility(XEvent *ev)
 {
 	XVisibilityEvent *e = &ev->xvisibility;
+	int was_visible = IS_SET(MODE_VISIBLE);
 
 	MODBIT(win.mode, e->state != VisibilityFullyObscured, MODE_VISIBLE);
+	if (!was_visible && IS_SET(MODE_VISIBLE))
+		xneeddraw = 1;
 }
 
 void
@@ -3360,8 +3366,9 @@ run(void)
 {
 	XEvent ev;
 	int w = win.w, h = win.h;
-	fd_set rfd;
+	fd_set rfd, wfd;
 	int xfd = XConnectionNumber(xw.dpy), ttyfd, xev, drawing;
+	int xbackpressure = 0;
 	struct timespec seltv, *tv, now, lastblink, trigger;
 	struct timespec lastdraw = {0};
 	double timeout;
@@ -3386,9 +3393,18 @@ run(void)
 	cresize(w, h);
 
 	for (timeout = -1, drawing = 0, lastblink = (struct timespec){0};;) {
+		fd_set *wfds = NULL;
 		FD_ZERO(&rfd);
 		FD_SET(ttyfd, &rfd);
 		FD_SET(xfd, &rfd);
+		if (ttywrite_pending() || xbackpressure) {
+			FD_ZERO(&wfd);
+			if (ttywrite_pending())
+				FD_SET(ttyfd, &wfd);
+			if (xbackpressure)
+				FD_SET(xfd, &wfd);
+			wfds = &wfd;
+		}
 
 		if (XPending(xw.dpy) || ttyread_pending())
 			timeout = 0;  /* existing events might not set xfd */
@@ -3397,11 +3413,16 @@ run(void)
 		seltv.tv_nsec = 1E6 * (timeout - 1E3 * seltv.tv_sec);
 		tv = timeout >= 0 ? &seltv : NULL;
 
-		if (pselect(MAX(xfd, ttyfd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
+		if (pselect(MAX(xfd, ttyfd)+1, &rfd, wfds, NULL, tv, NULL) < 0) {
 			if (errno == EINTR)
 				continue;
 			die("select failed: %s\n", strerror(errno));
 		}
+
+		if (wfds && FD_ISSET(ttyfd, wfds))
+			ttywrite_flush();
+		if (wfds && FD_ISSET(xfd, wfds))
+			xbackpressure = 0;
 
 		int ttyin = FD_ISSET(ttyfd, &rfd) || ttyread_pending();
 		if (ttyin)
@@ -3474,6 +3495,23 @@ run(void)
 		if (xfps && TIMEDIFF(now, lastdraw) < 1000.0 / xfps) {
 			timeout = 1000.0 / xfps - TIMEDIFF(now, lastdraw);
 			continue;
+		}
+
+		/*
+		 * ETX-only backpressure guard: if the X11 proxy socket buffer is
+		 * full (remote WAN stall), skip this intermediate frame instead of
+		 * blocking inside XFlush() so input/PTY stay live and we paint the
+		 * latest state as soon as xfd becomes writable again.
+		 */
+		if (is_etx) {
+			struct pollfd xpfd = { .fd = xfd, .events = POLLOUT };
+			if (poll(&xpfd, 1, 0) == 0) {
+				xbackpressure = 1;
+				drawing = 1;
+				timeout = minlatency;
+				continue;
+			}
+			xbackpressure = 0;
 		}
 
 		/* idle detected or maxlatency exhausted -> draw */

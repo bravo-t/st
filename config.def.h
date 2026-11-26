@@ -102,8 +102,8 @@ static unsigned int actionfps = 30;
  * display keeps the values above. To force the choice at build time, set
  * ETXFLAGS in config.mk (-DETX=1: always, -DETX=0: never).
  */
-static double etxmaxlatency = 33;
-static unsigned int etxxfps = 60;
+static double etxmaxlatency = 50;
+static unsigned int etxxfps = 30;
 
 /*
  * blinking timeout (set to 0 to disable blinking) for the terminal blinking
