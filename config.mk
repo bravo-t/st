@@ -25,9 +25,16 @@ LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft -lXrender \
        `$(PKG_CONFIG) --libs fontconfig` \
        `$(PKG_CONFIG) --libs freetype2`
 
+# Exceed TurboX (ETX) redraw pacing (etxmaxlatency/etxxfps in config.h) is
+# chosen at run time: only an ETX X server (HCL_ThinX extension) gets it, so
+# one binary serves ETX and local displays alike. To force it instead:
+#ETXFLAGS = -DETX=1	# always use the ETX pacing
+#ETXFLAGS = -DETX=0	# never use it
+# (objects depend on this file, so editing it is enough to rebuild them)
+
 # flags
 CFLAGS = -std=c99 -O3
-STCPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=600
+STCPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=600 $(ETXFLAGS)
 STCFLAGS = $(INCS) $(STCPPFLAGS) $(CPPFLAGS) $(CFLAGS)
 STLDFLAGS = $(LIBS) $(LDFLAGS)
 

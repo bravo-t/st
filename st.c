@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -36,7 +37,9 @@
 #define ESC_ARG_SIZ   16
 #define STR_BUF_SIZ   ESC_BUF_SIZ
 #define STR_ARG_SIZ   ESC_ARG_SIZ
+#ifndef HISTSIZE
 #define HISTSIZE      1000000 // scrollback limit
+#endif
 
 /* macros */
 #define IS_SET(flag)		((term.mode & (flag)) != 0)
@@ -44,10 +47,9 @@
 #define ISCONTROLC1(c)		(BETWEEN(c, 0x80, 0x9f))
 #define ISCONTROL(c)		(ISCONTROLC0(c) || ISCONTROLC1(c))
 #define ISDELIM(u)		(u && wcschr(worddelimiters, u))
-#define TLINE(y)		((y) < term.scr ? term.hist[((y) + term.histi - \
-               term.scr + HISTSIZE + 1) % HISTSIZE] : \
+#define TLINE(y)		((y) < term.scr ? thistline(((y) + term.histi - \
+               term.scr + HISTSIZE + 1) % HISTSIZE) : \
                term.line[(y) - term.scr])
-#define TLINE_HIST(y)           ((y) <= HISTSIZE-term.row+2 ? term.hist[(y)] : term.line[(y-HISTSIZE+term.row-3)])
 
 enum term_mode {
 	MODE_WRAP        = 1 << 0,
@@ -122,6 +124,7 @@ typedef struct {
 	Line *line;   /* screen */
 	Line *alt;    /* alternate screen */
     Line hist[HISTSIZE]; /* history buffer */
+    int histcol[HISTSIZE]; /* stored (trimmed) width of each history line */
     int histi;           /* history index */
     int scr;             /* history scroll back */
     int histwcount;      /* how many lines have been written */
@@ -212,8 +215,8 @@ static void tdefutf8(char);
 static int32_t tdefcolor(const int *, int *, int);
 static void tdeftran(char);
 static void tstrsequence(uchar);
-
-static void drawregion(int, int, int, int);
+static Line thistline(int);
+static Line tvisline(int, Glyph *);
 
 static void selnormalize(void);
 static void selscroll(int, int);
@@ -327,6 +330,15 @@ utf8decode(const char *c, Rune *u, size_t clen)
 	*u = UTF_INVALID;
 	if (!clen)
 		return 0;
+	/*
+	 * Fast path: plain ASCII is the overwhelming majority of terminal
+	 * output. It needs no utfmask table walk and is always valid, so
+	 * skip straight out instead of running the general decoder.
+	 */
+	if (!((uchar)c[0] & 0x80)) {
+		*u = (uchar)c[0];
+		return 1;
+	}
 	udecoded = utf8decodebyte(c[0], &len);
 	if (!BETWEEN(len, 1, UTF_SIZ))
 		return 1;
@@ -454,20 +466,6 @@ tlinelen(int y)
 		--i;
 
 	return i;
-}
-
-int
-tlinehistlen(int y)
-{
-    int i = term.col;
-
-    if (TLINE_HIST(y)[i - 1].mode & ATTR_WRAP)
-        return i;
-
-    while (i > 0 && TLINE_HIST(y)[i - 1].u == ' ')
-        --i;
-
-    return i;
 }
 
 void
@@ -878,27 +876,50 @@ int ttyread_pending() { return twrite_aborted; }
 size_t
 ttyread(void)
 {
-	static char buf[BUFSIZ];
+	static char buf[65536];
 	static int buflen = 0;
 	int ret, written;
+	size_t total = 0;
 
-	/* append read bytes to unprocessed bytes */
-	ret = twrite_aborted ? 1 : read(cmdfd, buf+buflen, LEN(buf)-buflen);
+	if (twrite_aborted) {
+		total = 1;
+	} else {
+		/* append read bytes to unprocessed bytes */
+		ret = read(cmdfd, buf + buflen, LEN(buf) - buflen);
+		switch (ret) {
+		case 0:
+			exit(0);
+		case -1:
+			die("couldn't read from shell: %s\n", strerror(errno));
+		default:
+			buflen += ret;
+			total += ret;
+			break;
+		}
 
-	switch (ret) {
-	case 0:
-		exit(0);
-	case -1:
-		die("couldn't read from shell: %s\n", strerror(errno));
-	default:
-		buflen += twrite_aborted ? 0 : ret;
-		written = twrite(buf, buflen, 0);
-		buflen -= written;
-		/* keep any incomplete UTF-8 byte sequence for the next call */
-		if (buflen > 0)
-			memmove(buf, buf + written, buflen);
-		return ret;
+		/*
+		 * Drain additional immediately-ready PTY chunks into buf
+		 * without blocking, avoiding a full pselect + XPending loop
+		 * every 4095 bytes during bulk output.
+		 */
+		while (LEN(buf) - buflen >= 4096) {
+			struct pollfd pfd = { .fd = cmdfd, .events = POLLIN };
+			if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+				break;
+			ret = read(cmdfd, buf + buflen, LEN(buf) - buflen);
+			if (ret <= 0)
+				break;
+			buflen += ret;
+			total += ret;
+		}
 	}
+
+	written = twrite(buf, buflen, 0);
+	buflen -= written;
+	/* keep any incomplete UTF-8 byte sequence for the next call */
+	if (buflen > 0)
+		memmove(buf, buf + written, buflen);
+	return total;
 }
 
 void
@@ -1182,6 +1203,99 @@ kscrollup(const Arg* a)
 	}
 }
 
+/*
+ * Scrollback storage
+ *
+ * A history line is stored trimmed: only the cells up to its last cell
+ * that differs from a default blank, with that width in term.histcol[].
+ * The missing tail is recreated on demand with tdefblank() cells, which
+ * are indistinguishable from what was trimmed. Two consequences:
+ *  - memory and page faults scale with the text, not the window width
+ *    (a 110-byte log line was a 5.5 KB row in a 344-column window, and
+ *    those page faults were 2/3 of st's CPU time during bulk output);
+ *  - tresize() never touches history, so it stays O(rows) however many
+ *    of the HISTSIZE lines exist (it used to realloc every one of them).
+ */
+static void
+tdefblank(Glyph *g)
+{
+	/* zeroed first: padding bytes must not differ between equal cells */
+	memset(g, 0, sizeof(*g));
+	g->u = ' ';
+	g->fg = seloptsch->defaultfg;
+	g->bg = seloptsch->defaultbg;
+}
+
+/*
+ * Number of leading cells of a screen line that history must keep.
+ * Compares whole cells against a zero-padded default blank: cleared cells
+ * match byte for byte, and a cell that differs only in padding is merely
+ * kept (less trimming), never dropped, so the result is always lossless.
+ */
+static int
+thistlen(const Glyph *line)
+{
+	Glyph blank;
+	int x = term.col;
+
+	tdefblank(&blank);
+	while (x > 0 && !memcmp(&line[x-1], &blank, sizeof(blank)))
+		x--;
+	return x;
+}
+
+/* copy a screen line into history slot idx, reusing the slot's memory */
+static void
+thistpush(int idx, const Glyph *line)
+{
+	int len = thistlen(line);
+
+	/* keep at least one cell: a non-NULL slot means "written" */
+	term.hist[idx] = xrealloc(term.hist[idx], MAX(len, 1) * sizeof(Glyph));
+	memcpy(term.hist[idx], line, len * sizeof(Glyph));
+	term.histcol[idx] = len;
+}
+
+/*
+ * Return history line idx with at least term.col valid cells, widening it
+ * in place. Used by selection/word-snapping, which index whole rows;
+ * draw() uses tvisline() instead so that merely viewing scrollback does
+ * not re-inflate it.
+ */
+static Line
+thistline(int idx)
+{
+	Line l = term.hist[idx];
+	int x;
+
+	if (l && term.histcol[idx] < term.col) {
+		l = xrealloc(l, term.col * sizeof(Glyph));
+		for (x = term.histcol[idx]; x < term.col; x++)
+			tdefblank(&l[x]);
+		term.hist[idx] = l;
+		term.histcol[idx] = term.col;
+	}
+	return l;
+}
+
+/* like TLINE(y), but pads a narrow history line into scratch instead */
+static Line
+tvisline(int y, Glyph *scratch)
+{
+	int idx, w, x;
+
+	if (y >= term.scr)
+		return term.line[y - term.scr];
+	idx = (y + term.histi - term.scr + HISTSIZE + 1) % HISTSIZE;
+	w = term.histcol[idx];
+	if (w >= term.col)
+		return term.hist[idx];
+	memcpy(scratch, term.hist[idx], w * sizeof(Glyph));
+	for (x = w; x < term.col; x++)
+		tdefblank(&scratch[x]);
+	return scratch;
+}
+
 void
 tscrolldown(int orig, int n, int copyhist)
 {
@@ -1190,15 +1304,26 @@ tscrolldown(int orig, int n, int copyhist)
 
 	LIMIT(n, 0, term.bot-orig+1);
 
-    if (copyhist) {
-        term.histi = (term.histi - 1 + HISTSIZE) % HISTSIZE;
-        temp = term.hist[term.histi];
-        /* history lines are allocated lazily; create one on first use */
-        if (!temp)
-            temp = xmalloc(term.col * sizeof(Glyph));
-        term.hist[term.histi] = term.line[term.bot];
-        term.line[term.bot] = temp;
-    }
+	/*
+	 * Same history effect as the scrollback patch's pointer swap: slot
+	 * histi-1 takes the bottom line and its old content is dropped. The
+	 * screen keeps its own row buffer, which is cleared below.
+	 */
+	if (copyhist) {
+		term.histi = (term.histi - 1 + HISTSIZE) % HISTSIZE;
+		thistpush(term.histi, term.line[term.bot]);
+		/*
+		 * The visible history window [histi-histwcount+1, histi] just
+		 * moved back one slot. Unless the ring is full, its new oldest
+		 * slot was never written (NULL), and scrolling back to it or
+		 * selecting it crashed. Shrink the window instead.
+		 */
+		if (term.histwcount > 0 && term.histwcount < HISTSIZE) {
+			term.histwcount--;
+			if (term.scr > term.histwcount)
+				term.scr = term.histwcount;
+		}
+	}
 
 	tsetdirt(orig, term.bot-n);
 	tclearregion(0, term.bot-n+1, term.col-1, term.bot);
@@ -1220,21 +1345,16 @@ tscrollup(int orig, int n, int copyhist)
 
 	LIMIT(n, 0, term.bot-orig+1);
 
-    if (copyhist) {
-        term.histi = (term.histi + 1) % HISTSIZE;
-        temp = term.hist[term.histi];
-        /* history lines are allocated lazily; create one on first use */
-        if (!temp)
-            temp = xmalloc(term.col * sizeof(Glyph));
-        term.hist[term.histi] = term.line[orig];
-        term.line[orig] = temp;
+	/* the screen row keeps its buffer; history gets a trimmed copy */
+	if (copyhist) {
+		term.histi = (term.histi + 1) % HISTSIZE;
+		thistpush(term.histi, term.line[orig]);
+		if (term.histwcount < HISTSIZE)
+			term.histwcount++;
+	}
 
-        if (term.histwcount < HISTSIZE)
-            term.histwcount++;
-    }
-
-    if (term.scr > 0 && term.scr < HISTSIZE)
-        term.scr = MIN(term.scr + n, HISTSIZE-1);
+	if (copyhist && term.scr > 0 && term.scr < HISTSIZE)
+		term.scr = MIN(term.scr + n, MIN(term.histwcount, HISTSIZE-1));
 
 	tclearregion(0, orig, term.col-1, orig+n-1);
 	tsetdirt(orig+n, term.bot);
@@ -1373,7 +1493,12 @@ tsetchar(Rune u, const Glyph *attr, int x, int y)
 	term.line[y][x] = *attr;
 	term.line[y][x].u = u;
 
-    if (isboxdraw(u))
+    /*
+     * Cheap inline reject before the cross-TU call: every glyph isboxdraw()
+     * accepts lives at U+2500 (box) or U+2800 (braille) or above, so normal
+     * text never pays for the call.
+     */
+    if (u >= 0x2500 && isboxdraw(u))
         term.line[y][x].mode |= ATTR_BOXDRAW;
 }
 
@@ -1381,7 +1506,8 @@ void
 tclearregion(int x1, int y1, int x2, int y2)
 {
 	int x, y, temp;
-	Glyph *gp;
+	Glyph blank;
+	Line line;
 
 	if (x1 > x2)
 		temp = x1, x1 = x2, x2 = temp;
@@ -1393,17 +1519,45 @@ tclearregion(int x1, int y1, int x2, int y2)
 	LIMIT(y1, 0, term.row-1);
 	LIMIT(y2, 0, term.row-1);
 
+	/*
+	 * Test selection overlap once up front so the inner cell-clearing
+	 * loop is branchless and auto-vectorizes cleanly.
+	 */
+	if (sel.mode != SEL_EMPTY && sel.ob.x != -1 &&
+	    sel.alt == IS_SET(MODE_ALTSCREEN) &&
+	    y1 <= sel.ne.y && y2 >= sel.nb.y) {
+		if (sel.type == SEL_RECTANGULAR) {
+			if (x1 <= sel.ne.x && x2 >= sel.nb.x)
+				selclear();
+		} else {
+			int cy1 = MAX(y1, sel.nb.y);
+			int cy2 = MIN(y2, sel.ne.y);
+			for (y = cy1; y <= cy2; y++) {
+				int sx1 = (y == sel.nb.y) ? sel.nb.x : 0;
+				int sx2 = (y == sel.ne.y) ? sel.ne.x : term.col - 1;
+				if (x1 <= sx2 && x2 >= sx1) {
+					selclear();
+					break;
+				}
+			}
+		}
+	}
+
+	/*
+	 * Zero the struct first so its padding bytes are deterministic: the
+	 * renderer diffs rows with memcmp, and garbage padding would make
+	 * identical blank cells look changed and force needless redraws.
+	 */
+	memset(&blank, 0, sizeof(blank));
+	blank.u = ' ';
+	blank.fg = term.c.attr.fg;
+	blank.bg = term.c.attr.bg;
+
 	for (y = y1; y <= y2; y++) {
 		term.dirty[y] = 1;
-		for (x = x1; x <= x2; x++) {
-			gp = &term.line[y][x];
-			if (selected(x, y))
-				selclear();
-			gp->fg = term.c.attr.fg;
-			gp->bg = term.c.attr.bg;
-			gp->mode = 0;
-			gp->u = ' ';
-		}
+		line = term.line[y];
+		for (x = x1; x <= x2; x++)
+			line[x] = blank;
 	}
 }
 
@@ -2034,7 +2188,12 @@ csidump(void)
 void
 csireset(void)
 {
-	memset(&csiescseq, 0, sizeof(csiescseq));
+	csiescseq.len = 0;
+	csiescseq.priv = 0;
+	csiescseq.narg = 0;
+	csiescseq.mode[0] = 0;
+	csiescseq.mode[1] = 0;
+	memset(csiescseq.arg, 0, sizeof(csiescseq.arg));
 }
 
 void
@@ -2195,9 +2354,8 @@ void
 externalpipe(const Arg *arg)
 {
    int to[2];
-   char buf[UTF_SIZ];
    void (*oldsigpipe)(int);
-   Glyph *bp, *end;
+   Glyph *bp;
    int lastpos, n, newline;
 
    if (pipe(to) == -1)
@@ -2222,26 +2380,51 @@ externalpipe(const Arg *arg)
    /* ignore sigpipe for now, in case child exists early */
    oldsigpipe = signal(SIGPIPE, SIG_IGN);
    newline = 0;
+   char *linebuf = xmalloc((size_t)term.col * UTF_SIZ + 2);
    for (n = 0; n <= HISTSIZE + 2; n++) {
-       bp = TLINE_HIST(n);
+       size_t outlen = 0;
+       int w, len, x;
+
+       /*
+        * Same row order and output as before: history slots by index,
+        * then the screen. History lines are read in trimmed form (cells
+        * from w on are default blanks) rather than widened, which would
+        * re-inflate up to HISTSIZE lines in one go.
+        */
+       if (n <= HISTSIZE - term.row + 2) {
+           bp = term.hist[n];
+           w = bp ? MIN(term.histcol[n], term.col) : 0;
+       } else {
+           bp = term.line[n - HISTSIZE + term.row - 3];
+           w = term.col;
+       }
        /* skip history lines that were never written (lazily allocated) */
        if (!bp)
            continue;
-       lastpos = MIN(tlinehistlen(n) + 1, term.col) - 1;
+       if (w == term.col && (bp[w - 1].mode & ATTR_WRAP)) {
+           len = w;
+       } else {
+           for (len = w; len > 0 && bp[len - 1].u == ' '; len--)
+               ;
+       }
+       lastpos = MIN(len + 1, term.col) - 1;
        if (lastpos < 0)
            break;
        if (lastpos == 0)
            continue;
-       end = &bp[lastpos + 1];
-       for (; bp < end; ++bp)
-           if (xwrite(to[1], buf, utf8encode(bp->u, buf)) < 0)
+       for (x = 0; x <= lastpos; x++)
+           outlen += utf8encode(x < w ? bp[x].u : ' ', linebuf + outlen);
+       if ((newline = lastpos < w && (bp[lastpos].mode & ATTR_WRAP))) {
+           if (outlen > 0 && xwrite(to[1], linebuf, outlen) < 0)
                break;
-       if ((newline = TLINE_HIST(n)[lastpos].mode & ATTR_WRAP))
            continue;
-       if (xwrite(to[1], "\n", 1) < 0)
+       }
+       linebuf[outlen++] = '\n';
+       if (xwrite(to[1], linebuf, outlen) < 0)
            break;
        newline = 0;
    }
+   free(linebuf);
    if (newline)
        (void)xwrite(to[1], "\n", 1);
    close(to[1]);
@@ -2722,7 +2905,8 @@ check_control_code:
 		 */
 		return;
 	}
-	if (selected(term.c.x, term.c.y))
+	/* cheap inline test first: this runs for every printed character */
+	if (sel.ob.x != -1 && selected(term.c.x, term.c.y))
 		selclear();
 
 	gp = &term.line[term.c.y][term.c.x];
@@ -2766,10 +2950,69 @@ check_control_code:
 	}
 }
 
+/*
+ * Fast path for a run of printable ASCII in plain-text state: the bulk of
+ * all terminal output, and tputc() was the top CPU cost while printing.
+ * It must leave exactly the state tputc() would (tests/test_st.c fuzzes
+ * the two against each other), so it only runs when none of the cases
+ * tputc() handles specially can apply: an escape or string sequence in
+ * progress, printer or insert mode, the DEC line-drawing charset (which
+ * translates 0x41-0x7e), or an active selection (which output can clear).
+ * Returns the number of bytes consumed; 0 means "use tputc()".
+ */
+static int asciifastpath = 1;
+
+static int
+tputascii(const char *s, int len)
+{
+	Glyph *gp;
+	Line line;
+	int i, x, y;
+	uchar c;
+
+	if (!asciifastpath || term.esc || (term.mode & (MODE_PRINT|MODE_INSERT)) ||
+	    term.trantbl[term.charset] == CS_GRAPHIC0 || sel.ob.x != -1)
+		return 0;
+
+	for (i = 0; i < len; i++) {
+		c = s[i];
+		if (c < 0x20 || c > 0x7e)
+			break;
+		if ((term.mode & MODE_WRAP) && (term.c.state & CURSOR_WRAPNEXT)) {
+			term.line[term.c.y][term.c.x].mode |= ATTR_WRAP;
+			tnewline(1);
+		}
+		x = term.c.x;
+		y = term.c.y;
+		line = term.line[y];
+		gp = &line[x];
+		/* overwriting half of a wide character blanks the other half */
+		if (gp->mode & ATTR_WIDE) {
+			if (x + 1 < term.col) {
+				line[x + 1].u = ' ';
+				line[x + 1].mode &= ~ATTR_WDUMMY;
+			}
+		} else if (gp->mode & ATTR_WDUMMY) {
+			line[x - 1].u = ' ';
+			line[x - 1].mode &= ~ATTR_WIDE;
+		}
+		term.dirty[y] = 1;
+		*gp = term.c.attr;
+		gp->u = c;
+		if (x + 1 < term.col)
+			tmoveto(x + 1, y);
+		else
+			term.c.state |= CURSOR_WRAPNEXT;
+	}
+	if (i)
+		term.lastc = (uchar)s[i - 1];
+	return i;
+}
+
 int
 twrite(const char *buf, int buflen, int show_ctrl)
 {
-	int charsize;
+	int charsize, k;
 	Rune u;
 	int n;
 
@@ -2790,6 +3033,14 @@ twrite(const char *buf, int buflen, int show_ctrl)
 			twrite_aborted = 1;
 			break;  // ESU - allow rendering before a new BSU
 		}
+		/*
+		 * Printable ASCII cannot end a synchronized update or be
+		 * affected by show_ctrl, so a whole run can go at once.
+		 */
+		if (u >= 0x20 && u < 0x7f && (k = tputascii(buf + n, buflen - n))) {
+			charsize = k;
+			continue;
+		}
 		if (show_ctrl && ISCONTROL(u)) {
 			if (u & 0x80) {
 				u &= 0x7f;
@@ -2808,7 +3059,7 @@ twrite(const char *buf, int buflen, int show_ctrl)
 void
 tresize(int col, int row)
 {
-	int i, j;
+	int i;
 	int minrow = MIN(row, term.row);
 	int mincol = MIN(col, term.col);
 	int *bp;
@@ -2847,20 +3098,11 @@ tresize(int col, int row)
 	term.dirty = xrealloc(term.dirty, row * sizeof(*term.dirty));
 	term.tabs = xrealloc(term.tabs, col * sizeof(*term.tabs));
 
-    /*
-     * History lines are allocated lazily as the scrollback fills, so only
-     * lines that already exist need to be resized; the rest stay NULL until
-     * they are first written.
-     */
-    for (i = 0; i < HISTSIZE; i++) {
-        if (!term.hist[i])
-            continue;
-        term.hist[i] = xrealloc(term.hist[i], col * sizeof(Glyph));
-        for (j = mincol; j < col; j++) {
-            term.hist[i][j] = term.c.attr;
-            term.hist[i][j].u = ' ';
-        }
-    }
+	/*
+	 * History is not resized here: each line records its own width in
+	 * term.histcol[] and is padded on access (see thistpush()), which
+	 * keeps tresize() O(rows) rather than O(HISTSIZE).
+	 */
 
 	/* resize each row to new width, zero-pad if needed */
 	for (i = 0; i < minrow; i++) {
@@ -2911,22 +3153,13 @@ resettitle(void)
 }
 
 void
-drawregion(int x1, int y1, int x2, int y2)
-{
-	int y;
-
-	for (y = y1; y < y2; y++) {
-		if (!term.dirty[y])
-			continue;
-
-		term.dirty[y] = 0;
-		xdrawline(TLINE(y), x1, y, x2);
-	}
-}
-
-void
 draw(void)
 {
+	static Line *vislines = NULL;
+	static Glyph *scratch = NULL; /* padded copies of narrow history rows */
+	static size_t viscells = 0;
+	static int visrows = 0;
+	int y, hassel;
 	int cx = term.c.x, ocx = term.ocx, ocy = term.ocy;
 
 	if (!xstartdraw())
@@ -2940,10 +3173,26 @@ draw(void)
 	if (term.line[term.c.y][cx].mode & ATTR_WDUMMY)
 		cx--;
 
-	drawregion(0, 0, term.col, term.row);
-    if (term.scr == 0)
-        xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
-                    term.ocx, term.ocy, term.line[term.ocy][term.ocx]);
+	if (term.row > visrows) {
+		visrows = term.row;
+		vislines = xrealloc(vislines, (size_t)visrows * sizeof(*vislines));
+	}
+	if ((size_t)term.row * term.col > viscells) {
+		viscells = (size_t)term.row * term.col;
+		scratch = xrealloc(scratch, viscells * sizeof(*scratch));
+	}
+	/*
+	 * The renderer diffs whole rows against what it last drew, so the
+	 * per-line dirty flags are not needed to find changes.
+	 */
+	for (y = 0; y < term.row; y++) {
+		term.dirty[y] = 0;
+		vislines[y] = tvisline(y, &scratch[(size_t)y * term.col]);
+	}
+	hassel = !(sel.mode == SEL_EMPTY || sel.ob.x == -1 ||
+	           sel.alt != IS_SET(MODE_ALTSCREEN));
+
+	xdrawscreen(vislines, term.col, term.row, term.scr == 0, cx, term.c.y, hassel);
 	term.ocx = cx, term.ocy = term.c.y;
 	xfinishdraw();
 	if (ocx != term.ocx || ocy != term.ocy)

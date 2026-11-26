@@ -139,6 +139,7 @@ typedef struct {
 	short rbearing;
 	XftFont *match;
 	FcFontSet *set;
+	FcCharSet *setcs; /* union coverage of set, from FcFontSort() */
 	FcPattern *pattern;
 } Font;
 
@@ -188,7 +189,7 @@ static void cmessage(XEvent *);
 static void resize(XEvent *);
 static void focus(XEvent *);
 static uint buttonmask(uint);
-static int mouseaction(XEvent *, uint);
+static int mouseaction(XEvent *, uint, int);
 static void brelease(XEvent *);
 static void bpress(XEvent *);
 static void bmotion(XEvent *);
@@ -251,15 +252,75 @@ typedef struct {
 	XftFont *font;
 	int flags;
 	Rune unicodep;
+	int iscolor;
 } Fontcache;
+
+/*
+ * Direct-mapped cache of fallback-font lookups (hits and misses), so a rune
+ * missing from the primary font costs one probe instead of a scan of frc[]
+ * (and, for runes no font has, a 5-26 ms fontconfig query) on every redraw.
+ *
+ * Spec convention shared with xdrawglyphfontspecs(): a spec whose font is
+ * NULL is a placeholder that keeps specs[] 1:1 with the row's cells but is
+ * never sent to XRender (spaces, colour-font glyphs).
+ */
+#define FGCACHE_SIZE  4096
+#define FG_NOTFOUND   -1 /* no font has it: draw primary font's .notdef */
+#define FG_SKIP       -2 /* only a colour font has it: leave cell blank */
+typedef struct {
+	Rune rune;
+	int flags;
+	int frcidx; /* index into frc[], FG_NOTFOUND or FG_SKIP */
+	FT_UInt glyphidx;
+	unsigned char valid;
+} FallbackGlyphCache;
 
 /* Fontcache is an array now. A new font will be appended to the array. */
 static Fontcache *frc = NULL;
 static int frclen = 0;
 static int frccap = 0;
+static FallbackGlyphCache fgcache[FGCACHE_SIZE];
 static char *usedfont = NULL;
 static double usedfontsize = 0;
 static double defaultfontsize = 0;
+
+/* Shadow screen state for scroll-blitting and partial-rect XCopyArea */
+static Glyph *drawn_buf = NULL;
+static unsigned char *drawn_row_valid = NULL;
+static Glyph *drawn_eff_row = NULL;
+static int drawn_col = 0;
+static int drawn_row = 0;
+static int drawn_valid = 0;
+static int prev_cursor_drawn = 0;
+static int prev_cx = 0;
+static int prev_cy = 0;
+static int dirty_x1 = 0, dirty_y1 = 0, dirty_x2 = 0, dirty_y2 = 0;
+
+static void
+xinvalidatedrawn(void)
+{
+	drawn_valid = 0;
+	prev_cursor_drawn = 0;
+}
+
+static inline void
+xdirtyrect(int x1, int y1, int x2, int y2)
+{
+	if (x1 < dirty_x1) dirty_x1 = x1;
+	if (y1 < dirty_y1) dirty_y1 = y1;
+	if (x2 > dirty_x2) dirty_x2 = x2;
+	if (y2 > dirty_y2) dirty_y2 = y2;
+}
+
+static inline void
+xdirtycells(int x1, int y1, int x2, int y2, int col, int row)
+{
+	int px1 = (x1 <= 0) ? 0 : (win.hborderpx + x1 * win.cw);
+	int py1 = (y1 <= 0) ? 0 : (win.vborderpx + y1 * win.ch);
+	int px2 = (x2 >= col) ? win.w : (win.hborderpx + x2 * win.cw);
+	int py2 = (y2 >= row) ? win.h : (win.vborderpx + y2 * win.ch);
+	xdirtyrect(px1, py1, px2, py2);
+}
 
 static char *opt_alpha = NULL;
 static char *opt_class = NULL;
@@ -279,6 +340,7 @@ void
 invert(const Arg *dummy)
 {
     invertcolors = !invertcolors;
+    xinvalidatedrawn();
     redraw();
 }
 
@@ -485,8 +547,14 @@ buttonmask(uint button)
 	     : 0;
 }
 
+/*
+ * Run the first mshortcuts[] entry matching e. With explicitonly set,
+ * XK_ANY_MOD entries are ignored: used when the application has asked for
+ * mouse reports, so that only deliberate shortcuts (e.g. Alt+wheel) are
+ * taken away from it.
+ */
 int
-mouseaction(XEvent *e, uint release)
+mouseaction(XEvent *e, uint release, int explicitonly)
 {
 	MouseShortcut *ms;
 
@@ -494,6 +562,8 @@ mouseaction(XEvent *e, uint release)
 	uint state = e->xbutton.state & ~buttonmask(e->xbutton.button);
 
 	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
+		if (explicitonly && ms->mod == XK_ANY_MOD)
+			continue;
 		if (ms->release == release &&
 		    ms->button == e->xbutton.button &&
             (!ms->altscrn || (ms->altscrn == (tisaltscr() ? 1 : -1))) &&
@@ -518,11 +588,21 @@ bpress(XEvent *e)
 		buttons |= 1 << (btn-1);
 
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+		/*
+		 * The app wants mouse reports, which used to swallow Alt+wheel
+		 * entirely. On the primary screen st's own scrollback is what
+		 * the user sees, so let explicit-modifier wheel shortcuts
+		 * (Alt/Ctrl + Button4/5) scroll it; everything else, including
+		 * plain wheel, is still reported to the application.
+		 */
+		if (!tisaltscr() && (btn == Button4 || btn == Button5) &&
+		    mouseaction(e, 0, 1))
+			return;
 		mousereport(e);
 		return;
 	}
 
-	if (mouseaction(e, 0))
+	if (mouseaction(e, 0, 0))
 		return;
 
 	if (btn == Button1) {
@@ -751,7 +831,7 @@ brelease(XEvent *e)
 		return;
 	}
 
-	if (mouseaction(e, 1))
+	if (mouseaction(e, 1, 0))
 		return;
 	if (btn == Button1)
 		mousesel(e, 1);
@@ -807,6 +887,7 @@ xresize(int col, int row)
 
 	/* resize to new width */
 	xw.specbuf = xrealloc(xw.specbuf, col * sizeof(GlyphFontSpec));
+	xinvalidatedrawn();
 }
 
 void
@@ -897,6 +978,7 @@ xloadcols(void)
 		}
 
     xloadalpha();
+    xinvalidatedrawn();
     loaded = 1;
 }
 
@@ -926,6 +1008,7 @@ xsetcolorname(int x, const char *name)
 
 	XftColorFree(xw.dpy, xw.vis, xw.cmap, &dc.col[x]);
 	dc.col[x] = ncolor;
+	xinvalidatedrawn();
 
 	return 0;
 }
@@ -1055,6 +1138,7 @@ xloadfont(Font *f, FcPattern *pattern)
 		strlen(ascii_printable), &extents);
 
 	f->set = NULL;
+	f->setcs = NULL;
 	f->pattern = configured;
 
 	f->ascent = f->match->ascent;
@@ -1139,15 +1223,64 @@ xloadfonts(const char *fontstr, double fontsize)
 	FcPatternDestroy(pattern);
 }
 
+static int
+fcpatternsamefont(FcPattern *a, FcPattern *b)
+{
+	FcChar8 *fa = NULL, *fb = NULL;
+	int ia = 0, ib = 0;
+
+	if (!a || !b)
+		return 0;
+	if (FcPatternGetString(a, FC_FILE, 0, &fa) != FcResultMatch ||
+	    FcPatternGetString(b, FC_FILE, 0, &fb) != FcResultMatch)
+		return 0;
+	if (strcmp((const char *)fa, (const char *)fb) != 0)
+		return 0;
+	FcPatternGetInteger(a, FC_INDEX, 0, &ia);
+	FcPatternGetInteger(b, FC_INDEX, 0, &ib);
+	return ia == ib;
+}
+
+static int
+xfontiscolor(XftFont *xf)
+{
+	FcBool iscol = FcFalse;
+	return xf && FcPatternGetBool(xf->pattern, FC_COLOR, 0, &iscol) == FcResultMatch && iscol;
+}
+
 int
 xloadsparefont(FcPattern *pattern, int flags)
 {
    FcPattern *match;
    FcResult result;
+   Font *primary;
+   int i;
 
    match = FcFontMatch(NULL, pattern, &result);
    if (!match) {
        return 1;
+   }
+
+   /*
+    * Skip sparefonts that resolve to the exact same font file+index as
+    * the primary font or an already-loaded sparefont for this style.
+    * When configured icon fonts are not installed, all missing entries
+    * otherwise collapse to duplicate copies of the default sans font.
+    */
+   primary = (flags == FRC_ITALICBOLD) ? &dc.ibfont
+           : (flags == FRC_ITALIC)     ? &dc.ifont
+           : (flags == FRC_BOLD)       ? &dc.bfont
+                                       : &dc.font;
+   if (primary->match && fcpatternsamefont(match, primary->match->pattern)) {
+       FcPatternDestroy(match);
+       return 0;
+   }
+   for (i = 0; i < frclen; i++) {
+       if (frc[i].flags == flags && frc[i].font &&
+           fcpatternsamefont(match, frc[i].font->pattern)) {
+           FcPatternDestroy(match);
+           return 0;
+       }
    }
 
    if (!(frc[frclen].font = XftFontOpenPattern(xw.dpy, match))) {
@@ -1158,6 +1291,7 @@ xloadsparefont(FcPattern *pattern, int flags)
    frc[frclen].flags = flags;
    /* Believe U+0000 glyph will present in each default font */
    frc[frclen].unicodep = 0;
+   frc[frclen].iscolor = xfontiscolor(frc[frclen].font);
    frclen++;
 
    return 0;
@@ -1208,6 +1342,7 @@ xloadsparefonts(void)
        }
 
        FcPatternAddBool(pattern, FC_SCALABLE, 1);
+       FcPatternAddBool(pattern, FC_COLOR, FcFalse);
 
        FcConfigSubstitute(NULL, pattern, FcMatchPattern);
        XftDefaultSubstitute(xw.dpy, xw.scr, pattern);
@@ -1241,6 +1376,10 @@ xunloadfont(Font *f)
 	FcPatternDestroy(f->pattern);
 	if (f->set)
 		FcFontSetDestroy(f->set);
+	if (f->setcs)
+		FcCharSetDestroy(f->setcs);
+	f->set = NULL;
+	f->setcs = NULL;
 }
 
 void
@@ -1249,6 +1388,7 @@ xunloadfonts(void)
 	/* Free the loaded fonts in the font cache.  */
 	while (frclen > 0)
 		XftFontClose(xw.dpy, frc[--frclen].font);
+	memset(fgcache, 0, sizeof(fgcache));
 
 	xunloadfont(&dc.font);
 	xunloadfont(&dc.bfont);
@@ -1338,6 +1478,32 @@ xerror(Display *dpy, XErrorEvent *e)
 	return 0;
 }
 
+/*
+ * Is this an Exceed TurboX (ETX) display? Its X server advertises the
+ * HCL_ThinX extension; -DETX=0/1 (config.mk) overrides the detection.
+ */
+static int
+xisetx(void)
+{
+#ifdef ETX
+	return ETX;
+#else
+	int opcode, event, error;
+
+	return XQueryExtension(xw.dpy, "HCL_ThinX", &opcode, &event, &error);
+#endif
+}
+
+/* ETX-specific redraw pacing; any other display keeps the config values */
+static void
+xsetpacing(void)
+{
+	if (xisetx()) {
+		maxlatency = etxmaxlatency;
+		xfps = etxxfps;
+	}
+}
+
 void
 xinit(int cols, int rows)
 {
@@ -1352,6 +1518,7 @@ xinit(int cols, int rows)
 	if (!(xw.dpy = XOpenDisplay(NULL)))
 		die("can't open display\n");
 	XSetErrorHandler(xerror);
+	xsetpacing();
 	xw.scr = XDefaultScreen(xw.dpy);
 
     if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0)))) {
@@ -1362,7 +1529,17 @@ xinit(int cols, int rows)
         xw.depth = attr.depth;
     }
 
-    XMatchVisualInfo(xw.dpy, xw.scr, xw.depth, TrueColor, &vis);
+    if (!XMatchVisualInfo(xw.dpy, xw.scr, xw.depth, TrueColor, &vis)) {
+        /*
+         * The requested depth is not available (many X servers offer no
+         * 32-bit ARGB visual at all). XMatchVisualInfo leaves vis
+         * untouched on failure, so using it here would dereference
+         * garbage in XCreateColormap. Fall back to the screen default.
+         */
+        xw.depth = XDefaultDepth(xw.dpy, xw.scr);
+        if (!XMatchVisualInfo(xw.dpy, xw.scr, xw.depth, TrueColor, &vis))
+            die("no matching TrueColor visual\n");
+    }
     xw.vis = vis.visual;
 
 	/* font */
@@ -1488,6 +1665,104 @@ xinit(int cols, int rows)
     boxdraw_xinit(xw.dpy, xw.cmap, xw.draw, xw.vis);
 }
 
+/*
+ * Resolve a rune that the primary font lacks. Returns an index into frc[],
+ * or FG_NOTFOUND / FG_SKIP, and stores the glyph index in *gidx.
+ * Callers memoize the result in fgcache, so this runs once per rune/style.
+ */
+static int
+xfallbackglyph(Font *font, int frcflags, Rune rune, FT_UInt *gidx)
+{
+	FcResult fcres;
+	FcPattern *fcpattern, *fontpattern;
+	FcFontSet *fcsets[1];
+	FcCharSet *fccharset, *matchcs;
+	int f;
+
+	*gidx = 0;
+
+	/* Fonts opened earlier, in the same order the old code scanned them. */
+	for (f = 0; f < frclen; f++) {
+		if (frc[f].flags != frcflags)
+			continue;
+		if ((*gidx = XftCharIndex(xw.dpy, frc[f].font, rune))) {
+			if (frc[f].iscolor) {
+				*gidx = 0;
+				return FG_SKIP;
+			}
+			return f;
+		}
+	}
+
+	/*
+	 * FcFontSort() also reports the union coverage of every candidate
+	 * font. A rune outside it exists in no installed font, so skip the
+	 * per-rune fontconfig match (measured 5-26 ms) that could only fail.
+	 * This is what keeps `cat` of a binary file from stalling the terminal.
+	 */
+	if (!font->set)
+		font->set = FcFontSort(0, font->pattern, 1, &font->setcs, &fcres);
+	if (!font->set || !font->setcs || !FcCharSetHasChar(font->setcs, rune))
+		return FG_NOTFOUND;
+
+	fcpattern = FcPatternDuplicate(font->pattern);
+	fccharset = FcCharSetCreate();
+	FcCharSetAddChar(fccharset, rune);
+	FcPatternAddCharSet(fcpattern, FC_CHARSET, fccharset);
+	FcPatternAddBool(fcpattern, FC_SCALABLE, 1);
+	FcPatternAddBool(fcpattern, FC_COLOR, FcFalse);
+	FcConfigSubstitute(0, fcpattern, FcMatchPattern);
+	FcDefaultSubstitute(fcpattern);
+	fcsets[0] = font->set;
+	fontpattern = FcFontSetMatch(0, fcsets, 1, fcpattern, &fcres);
+	FcPatternDestroy(fcpattern);
+	FcCharSetDestroy(fccharset);
+
+	/* fontconfig returns its best match even when that font lacks the rune */
+	if (!fontpattern)
+		return FG_NOTFOUND;
+	if (FcPatternGetCharSet(fontpattern, FC_CHARSET, 0, &matchcs) == FcResultMatch &&
+	    !FcCharSetHasChar(matchcs, rune)) {
+		FcPatternDestroy(fontpattern);
+		return FG_NOTFOUND;
+	}
+
+	/* Reuse an open copy of the same font file rather than a duplicate. */
+	for (f = 0; f < frclen; f++) {
+		if (frc[f].flags == frcflags &&
+		    fcpatternsamefont(fontpattern, frc[f].font->pattern))
+			break;
+	}
+	if (f < frclen) {
+		FcPatternDestroy(fontpattern);
+	} else {
+		if (frclen >= frccap) {
+			frccap += 16;
+			frc = xrealloc(frc, frccap * sizeof(Fontcache));
+		}
+		/* XftFontOpenPattern takes ownership of fontpattern */
+		frc[frclen].font = XftFontOpenPattern(xw.dpy, fontpattern);
+		if (!frc[frclen].font)
+			die("XftFontOpenPattern failed seeking fallback font: %s\n",
+				strerror(errno));
+		frc[frclen].flags = frcflags;
+		frc[frclen].unicodep = rune;
+		frc[frclen].iscolor = xfontiscolor(frc[frclen].font);
+		f = frclen++;
+	}
+
+	/*
+	 * Colour (BGRA) fonts stay open so later runes they cover resolve
+	 * without fontconfig, but are never drawn: libXft < 2.3.5 dies with
+	 * BadLength in RenderAddGlyphs when uploading their glyphs.
+	 */
+	if (frc[f].iscolor)
+		return FG_SKIP;
+	if (!(*gidx = XftCharIndex(xw.dpy, frc[f].font, rune)))
+		return FG_NOTFOUND;
+	return f;
+}
+
 int
 xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x, int y)
 {
@@ -1498,10 +1773,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 	float runewidth = win.cw;
 	Rune rune;
 	FT_UInt glyphidx;
-	FcResult fcres;
-	FcPattern *fcpattern, *fontpattern;
-	FcFontSet *fcsets[] = { NULL };
-	FcCharSet *fccharset;
+	uint h;
 	int i, f, numspecs = 0;
 
     for (i = 0, xp = winx, yp = winy + font->ascent + win.cyo; i < len; ++i) {
@@ -1532,6 +1804,22 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 			yp = winy + font->ascent + win.cyo;
 		}
 
+		/*
+		 * Fast path for plain spaces: DRAW_BG already paints the cell
+		 * background, so emit a placeholder (font == NULL) that keeps
+		 * specs 1:1 with xdrawline() while skipping XftCharIndex and
+		 * the XRender glyph upload for the ~80% of cells that are blank.
+		 */
+		if (rune == ' ' && !(mode & ATTR_BOXDRAW)) {
+			specs[numspecs].font = NULL;
+			specs[numspecs].glyph = 0;
+			specs[numspecs].x = (short)xp;
+			specs[numspecs].y = (short)yp;
+			xp += runewidth;
+			numspecs++;
+			continue;
+		}
+
         if (mode & ATTR_BOXDRAW) {
             /* minor shoehorning: boxdraw uses only this ushort */
             glyphidx = boxdrawindex(&glyphs[i]);
@@ -1549,89 +1837,23 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 			continue;
 		}
 
-		/* Fallback on font cache, search the font cache for match. */
-		for (f = 0; f < frclen; f++) {
-			glyphidx = XftCharIndex(xw.dpy, frc[f].font, rune);
-			/* Everything correct. */
-			if (glyphidx && frc[f].flags == frcflags)
-				break;
-			/* We got a default font for a not found glyph. */
-			if (!glyphidx && frc[f].flags == frcflags
-					&& frc[f].unicodep == rune) {
-				break;
-			}
-		}
-
-		/* Nothing was found. Use fontconfig to find matching font. */
-		if (f >= frclen) {
-			if (!font->set)
-				font->set = FcFontSort(0, font->pattern,
-				                       1, 0, &fcres);
-			fcsets[0] = font->set;
-
-			/*
-			 * Nothing was found in the cache. Now use
-			 * some dozen of Fontconfig calls to get the
-			 * font for one single character.
-			 *
-			 * Xft and fontconfig are design failures.
-			 */
-			fcpattern = FcPatternDuplicate(font->pattern);
-			fccharset = FcCharSetCreate();
-
-			FcCharSetAddChar(fccharset, rune);
-			FcPatternAddCharSet(fcpattern, FC_CHARSET,
-					fccharset);
-			FcPatternAddBool(fcpattern, FC_SCALABLE, 1);
-			FcPatternAddBool(fcpattern, FC_COLOR, FcFalse);
-
-			FcConfigSubstitute(0, fcpattern,
-					FcMatchPattern);
-			FcDefaultSubstitute(fcpattern);
-
-			fontpattern = FcFontSetMatch(0, fcsets, 1,
-					fcpattern, &fcres);
-
-			/* Allocate memory for the new cache entry. */
-			if (frclen >= frccap) {
-				frccap += 16;
-				frc = xrealloc(frc, frccap * sizeof(Fontcache));
-			}
-
-			frc[frclen].font = XftFontOpenPattern(xw.dpy,
-					fontpattern);
-			if (!frc[frclen].font)
-				die("XftFontOpenPattern failed seeking fallback font: %s\n",
-					strerror(errno));
-			frc[frclen].flags = frcflags;
-			frc[frclen].unicodep = rune;
-
-			glyphidx = XftCharIndex(xw.dpy, frc[frclen].font, rune);
-
-			f = frclen;
-			frclen++;
-
-			FcPatternDestroy(fcpattern);
-			FcCharSetDestroy(fccharset);
-		}
-
 		/*
-		 * libXft (< 2.3.5) can crash with BadLength in
-		 * RenderAddGlyphs when uploading color/BGRA glyphs. Skip
-		 * such fallback fonts (leaving the cell blank) instead of
-		 * risking the crash.
+		 * Rune missing from the primary font: one probe of fgcache;
+		 * the full fallback search runs only on a cache miss.
 		 */
-		if (frc[f].font) {
-			FcBool iscol;
-			if (FcPatternGetBool(frc[f].font->pattern, FC_COLOR,
-					0, &iscol) == FcResultMatch && iscol) {
-				xp += runewidth;
-				continue;
-			}
+		h = ((rune * 2654435761u) ^ (uint)frcflags) & (FGCACHE_SIZE - 1);
+		if (!fgcache[h].valid || fgcache[h].rune != rune ||
+		    fgcache[h].flags != frcflags) {
+			fgcache[h].frcidx = xfallbackglyph(font, frcflags, rune,
+			                                   &fgcache[h].glyphidx);
+			fgcache[h].rune = rune;
+			fgcache[h].flags = frcflags;
+			fgcache[h].valid = 1;
 		}
-
-		specs[numspecs].font = frc[f].font;
-		specs[numspecs].glyph = glyphidx;
+		f = fgcache[h].frcidx;
+		specs[numspecs].font = (f >= 0) ? frc[f].font
+		                     : (f == FG_NOTFOUND) ? font->match : NULL;
+		specs[numspecs].glyph = fgcache[h].glyphidx;
 		specs[numspecs].x = (short)xp;
 		specs[numspecs].y = (short)yp;
 		xp += runewidth;
@@ -1649,7 +1871,6 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	    width = charlen * win.cw;
 	Color *fg, *bg, *temp, revfg, revbg, truefg, truebg;
 	XRenderColor colfg, colbg;
-	XRectangle r;
 
 	/* Fallback on color display for attributes not supported by the font */
 	if (base.mode & ATTR_ITALIC && base.mode & ATTR_BOLD) {
@@ -1753,11 +1974,11 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
     if (dmode & DRAW_BG) {
         /* Intelligent cleaning up of the borders. */
         if (x == 0) {
-			xclear(0, (y == 0)? 0 : winy, win.vborderpx,
+			xclear(0, (y == 0)? 0 : winy, win.hborderpx,
 				   winy + win.ch +
 				   ((winy + win.ch >= win.vborderpx + win.th)? win.h : 0));
         }
-        if (winx + width >= borderpx + win.tw) {
+        if (winx + width >= win.hborderpx + win.tw) {
 			xclear(winx + width, (y == 0)? 0 : winy, win.w,
 				   ((winy + win.ch >= win.vborderpx + win.th)? win.h : (winy + win.ch)));
         }
@@ -1773,8 +1994,25 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 		if (base.mode & ATTR_BOXDRAW) {
 			drawboxes(winx, winy, width / len, win.ch, fg, bg, specs, len);
 		} else {
-			/* Render the glyphs. */
-			XftDrawGlyphFontSpec(xw.draw, fg, specs, len);
+			/*
+			 * Drop placeholder specs (font == NULL: spaces and
+			 * colour-font glyphs) so XRender only sees real glyphs.
+			 * A missing glyph keeps its font with glyph 0 and still
+			 * renders the font's .notdef box, as it did before.
+			 */
+			XftGlyphFontSpec stackbuf[512];
+			XftGlyphFontSpec *fgspecs = (len <= (int)LEN(stackbuf))
+			    ? stackbuf : xmalloc((size_t)len * sizeof(*fgspecs));
+			int k, nfg = 0;
+
+			for (k = 0; k < len; k++) {
+				if (specs[k].font)
+					fgspecs[nfg++] = specs[k];
+			}
+			if (nfg > 0)
+				XftDrawGlyphFontSpec(xw.draw, fg, fgspecs, nfg);
+			if (fgspecs != stackbuf)
+				free(fgspecs);
 		}
 
         /* Render underline and strikethrough. */
@@ -1788,9 +2026,6 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 						width, 1);
         }
     }
-
-	/* Reset clip to none. */
-	XftDrawSetClip(xw.draw, 0);
 }
 
 void
@@ -1803,15 +2038,10 @@ xdrawglyph(Glyph g, int x, int y)
 	xdrawglyphfontspecs(&spec, g, numspecs, x, y, DRAW_BG | DRAW_FG);
 }
 
-void
-xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
+static void
+xdrawcursor_at(int cx, int cy, Glyph g)
 {
 	Color drawcol;
-
-	/* remove the old cursor */
-	if (selected(ox, oy))
-		og.mode ^= ATTR_REVERSE;
-	xdrawglyph(og, ox, oy);
 
 	if (IS_SET(MODE_HIDE))
 		return;
@@ -1890,6 +2120,16 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 }
 
 void
+xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
+{
+	/* remove the old cursor */
+	if (selected(ox, oy))
+		og.mode ^= ATTR_REVERSE;
+	xdrawglyph(og, ox, oy);
+	xdrawcursor_at(cx, cy, g);
+}
+
+void
 xsetenv(void)
 {
 	char buf[sizeof(long) * 8 + 1];
@@ -1929,6 +2169,9 @@ xsettitle(char *p, int pop)
 {
  	XTextProperty prop;
 
+	if (!pop && p && titlestack[tstki] && strcmp(titlestack[tstki], p) == 0)
+		return;
+
 	free(titlestack[tstki]);
 	if (pop) {
 		titlestack[tstki] = NULL;
@@ -1962,7 +2205,232 @@ xpushtitle(void)
 int
 xstartdraw(void)
 {
-	return IS_SET(MODE_VISIBLE);
+	if (!IS_SET(MODE_VISIBLE))
+		return 0;
+	dirty_x1 = win.w;
+	dirty_y1 = win.h;
+	dirty_x2 = 0;
+	dirty_y2 = 0;
+	if (!drawn_valid)
+		xdirtyrect(0, 0, win.w, win.h);
+	return 1;
+}
+
+static int
+rowhascontent(const Glyph *line, int col)
+{
+	int x;
+	for (x = 0; x < col; x++) {
+		if (line[x].u != ' ' || line[x].mode != 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Guess how far the screen content moved since the last frame by finding a
+ * few distinctive rows (anchors) of the new frame in the shadow buffer.
+ * Rows that occur more than twice (separators, repeated log lines) are
+ * ambiguous and skipped, and at most MAXSCROLLCAND shifts are scored, so
+ * the cost stays bounded on any screen. Returns 0 when no shift beats
+ * in-place diffing by a useful margin.
+ *
+ * Correctness never depends on the guess: after the blit, every row that
+ * differs from the shifted shadow buffer is repainted by the row diff.
+ */
+#define MAXSCROLLCAND 6
+static int
+xfindscroll(Line *lines, int col, int row, int matches0)
+{
+	int anchors[3] = { row / 2, row / 4, (3 * row) / 4 };
+	int cand[MAXSCROLLCAND], hit[2];
+	int a, i, y, oy, d, m, nhit, ay, off, ncand = 0;
+	int best_d = 0, best = matches0;
+	size_t rowbytes = (size_t)col * sizeof(Glyph);
+
+	for (a = 0; a < 3; a++) {
+		/* nearest non-blank row: blank rows match almost anywhere */
+		ay = -1;
+		for (off = 0; off < row / 4 && ay < 0; off++) {
+			if (anchors[a] + off < row &&
+			    rowhascontent(lines[anchors[a] + off], col))
+				ay = anchors[a] + off;
+			else if (anchors[a] - off >= 0 &&
+			         rowhascontent(lines[anchors[a] - off], col))
+				ay = anchors[a] - off;
+		}
+		if (ay < 0)
+			continue;
+
+		/* where did this row live in the previous frame? */
+		nhit = 0;
+		for (oy = 0; oy < row && nhit <= 2; oy++) {
+			if (oy == ay || !drawn_row_valid[oy] ||
+			    memcmp(lines[ay], &drawn_buf[(size_t)oy * col], rowbytes))
+				continue;
+			if (nhit < 2)
+				hit[nhit] = oy;
+			nhit++;
+		}
+		if (nhit == 0 || nhit > 2)
+			continue;
+
+		for (i = 0; i < nhit && ncand < MAXSCROLLCAND; i++) {
+			d = hit[i] - ay;
+			for (m = 0; m < ncand && cand[m] != d; m++)
+				;
+			if (m == ncand)
+				cand[ncand++] = d;
+		}
+	}
+
+	/* score each candidate: rows reusable if we shift by d */
+	for (i = 0; i < ncand; i++) {
+		d = cand[i];
+		m = 0;
+		for (y = MAX(0, -d); y < MIN(row, row - d); y++) {
+			if (drawn_row_valid[y + d] &&
+			    !memcmp(lines[y], &drawn_buf[(size_t)(y + d) * col], rowbytes))
+				m++;
+		}
+		if (m > best) {
+			best = m;
+			best_d = d;
+		}
+	}
+	/* the blit must save a few repaints to be worth an extra copy */
+	return (best > matches0 + 2) ? best_d : 0;
+}
+
+void
+xdrawscreen(Line *lines, int col, int row, int showcursor, int cx, int cy, int hassel)
+{
+	int y, x, best_d = 0, matches0 = 0;
+	int rowbytes = col * (int)sizeof(Glyph);
+	int cursor_kept = 0;
+
+	if (drawn_col != col || drawn_row != row || !drawn_buf) {
+		drawn_col = col;
+		drawn_row = row;
+		drawn_buf = xrealloc(drawn_buf, (size_t)row * (size_t)col * sizeof(Glyph));
+		drawn_row_valid = xrealloc(drawn_row_valid, (size_t)row);
+		drawn_eff_row = xrealloc(drawn_eff_row, (size_t)col * sizeof(Glyph));
+		drawn_valid = 0;
+		prev_cursor_drawn = 0;
+	}
+
+	/*
+	 * Detect vertical scrolling against the cursor-free shadow buffer
+	 * drawn_buf so we can shift unchanged rows inside xw.buf with one
+	 * server-side XCopyArea instead of re-rasterizing all rows via Xft.
+	 */
+	if (drawn_valid && !hassel && row >= 4) {
+		for (y = 0; y < row; y++) {
+			if (drawn_row_valid[y] &&
+			    memcmp(lines[y], &drawn_buf[(size_t)y * col], rowbytes) == 0)
+				matches0++;
+		}
+		if (matches0 < row - 2)
+			best_d = xfindscroll(lines, col, row, matches0);
+	}
+
+	/*
+	 * Decide whether the previously painted cursor on xw.buf can stay
+	 * untouched or must be erased before blitting/updating cells.
+	 */
+	if (drawn_valid && prev_cursor_drawn) {
+		int cursor_row_same = 0;
+		if (best_d == 0 && showcursor && !IS_SET(MODE_HIDE) &&
+		    prev_cx == cx && prev_cy == cy && !hassel &&
+		    drawn_row_valid[prev_cy] &&
+		    memcmp(lines[prev_cy], &drawn_buf[(size_t)prev_cy * col], rowbytes) == 0) {
+			cursor_row_same = 1;
+		}
+		if (cursor_row_same) {
+			cursor_kept = 1;
+		} else {
+			Glyph og = drawn_buf[(size_t)prev_cy * col + prev_cx];
+			xdrawglyph(og, prev_cx, prev_cy);
+			xdirtycells(prev_cx, prev_cy,
+			            prev_cx + ((og.mode & ATTR_WIDE) ? 2 : 1),
+			            prev_cy + 1, col, row);
+			prev_cursor_drawn = 0;
+		}
+	}
+
+	/* Apply server-side scroll-blit on xw.buf and mirror it in drawn_buf. */
+	if (best_d > 0) {
+		int keep = row - best_d;
+		XCopyArea(xw.dpy, xw.buf, xw.buf, dc.gc,
+		          win.hborderpx, win.vborderpx + best_d * win.ch,
+		          win.tw, keep * win.ch,
+		          win.hborderpx, win.vborderpx);
+		memmove(drawn_buf, drawn_buf + (size_t)best_d * col,
+		        (size_t)keep * (size_t)col * sizeof(Glyph));
+		memmove(drawn_row_valid, drawn_row_valid + best_d, (size_t)keep);
+		memset(drawn_row_valid + keep, 0, (size_t)best_d);
+		xdirtycells(0, 0, col, keep, col, row);
+	} else if (best_d < 0) {
+		int k = -best_d;
+		int keep = row - k;
+		XCopyArea(xw.dpy, xw.buf, xw.buf, dc.gc,
+		          win.hborderpx, win.vborderpx,
+		          win.tw, keep * win.ch,
+		          win.hborderpx, win.vborderpx + k * win.ch);
+		memmove(drawn_buf + (size_t)k * col, drawn_buf,
+		        (size_t)keep * (size_t)col * sizeof(Glyph));
+		memmove(drawn_row_valid + k, drawn_row_valid, (size_t)keep);
+		memset(drawn_row_valid, 0, (size_t)k);
+		xdirtycells(0, k, col, row, col, row);
+	}
+
+	/* Redraw only rows (and column spans) that actually changed. */
+	for (y = 0; y < row; y++) {
+		const Glyph *src = lines[y];
+		Glyph *dst = &drawn_buf[(size_t)y * col];
+
+		if (hassel) {
+			memcpy(drawn_eff_row, lines[y], rowbytes);
+			for (x = 0; x < col; x++) {
+				if (selected(x, y))
+					drawn_eff_row[x].mode ^= ATTR_REVERSE;
+			}
+			src = drawn_eff_row;
+		}
+
+		if (!drawn_valid || !drawn_row_valid[y]) {
+			xdrawline(lines[y], 0, y, col);
+			memcpy(dst, src, rowbytes);
+			drawn_row_valid[y] = 1;
+			xdirtycells(0, y, col, y + 1, col, row);
+		} else if (memcmp(src, dst, rowbytes) != 0) {
+			int x1 = 0, x2 = col - 1;
+			while (x1 < col && memcmp(&src[x1], &dst[x1], sizeof(Glyph)) == 0)
+				x1++;
+			while (x2 > x1 && memcmp(&src[x2], &dst[x2], sizeof(Glyph)) == 0)
+				x2--;
+			/* Expand by 1 cell each side for italic/glyph bearing overhang */
+			if (x1 > 0) x1--;
+			if (x2 + 1 < col) x2++;
+			while (x1 > 0 && (lines[y][x1].mode & ATTR_WDUMMY))
+				x1--;
+			if (x2 + 1 < col && (lines[y][x2].mode & ATTR_WIDE))
+				x2++;
+			xdrawline(lines[y], x1, y, x2 + 1);
+			memcpy(dst, src, rowbytes);
+			xdirtycells(x1, y, x2 + 1, y + 1, col, row);
+		}
+	}
+	drawn_valid = 1;
+
+	if (showcursor && !cursor_kept && !IS_SET(MODE_HIDE)) {
+		xdrawcursor_at(cx, cy, lines[cy][cx]);
+		prev_cursor_drawn = 1;
+		prev_cx = cx;
+		prev_cy = cy;
+		xdirtycells(cx, cy, cx + ((lines[cy][cx].mode & ATTR_WIDE) ? 2 : 1),
+		            cy + 1, col, row);
+	}
 }
 
 void
@@ -2007,8 +2475,12 @@ xdrawline(Line line, int x1, int y1, int x2)
 void
 xfinishdraw(void)
 {
-	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
-			win.h, 0, 0);
+	if (dirty_x1 < dirty_x2 && dirty_y1 < dirty_y2) {
+		XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc,
+		          dirty_x1, dirty_y1,
+		          dirty_x2 - dirty_x1, dirty_y2 - dirty_y1,
+		          dirty_x1, dirty_y1);
+	}
 	XSetForeground(xw.dpy, dc.gc,
 			dc.col[IS_SET(MODE_REVERSE)?
 				seloptsch->defaultfg : seloptsch->defaultbg].pixel);
@@ -2029,7 +2501,10 @@ xximspot(int x, int y)
 void
 expose(XEvent *ev)
 {
-	redraw();
+	if (ev->xexpose.count == 0) {
+		xinvalidatedrawn();
+		redraw();
+	}
 }
 
 void
@@ -2058,8 +2533,10 @@ xsetmode(int set, unsigned int flags)
 {
 	int mode = win.mode;
 	MODBIT(win.mode, set, flags);
-	if ((win.mode & MODE_REVERSE) != (mode & MODE_REVERSE))
+	if ((win.mode & MODE_REVERSE) != (mode & MODE_REVERSE)) {
+		xinvalidatedrawn();
 		redraw();
+	}
 }
 
 int
@@ -2067,7 +2544,10 @@ xsetcursor(int cursor)
 {
 	if (!BETWEEN(cursor, 0, 7)) /* 7: st extension */
 		return 1;
-	win.cursor = cursor;
+	if (win.cursor != cursor) {
+		win.cursor = cursor;
+		xinvalidatedrawn();
+	}
 	return 0;
 }
 
@@ -2108,6 +2588,7 @@ focus(XEvent *ev)
         if (!focused) {
             focused = true;
             xloadalpha();
+            xinvalidatedrawn();
             redraw();
         }
 	} else {
@@ -2119,6 +2600,7 @@ focus(XEvent *ev)
         if (focused) {
             focused = false;
             xloadalpha();
+            xinvalidatedrawn();
             redraw();
         }
 	}
@@ -2242,8 +2724,10 @@ cmessage(XEvent *e)
 		if (e->xclient.data.l[1] == XEMBED_FOCUS_IN) {
 			win.mode |= MODE_FOCUSED;
 			xseturgency(0);
+			xinvalidatedrawn();
 		} else if (e->xclient.data.l[1] == XEMBED_FOCUS_OUT) {
 			win.mode &= ~MODE_FOCUSED;
+			xinvalidatedrawn();
 		}
 	} else if (e->xclient.data.l[0] == xw.wmdeletewin) {
 		ttyhangup();
@@ -2271,6 +2755,7 @@ run(void)
 	fd_set rfd;
 	int xfd = XConnectionNumber(xw.dpy), ttyfd, xev, drawing;
 	struct timespec seltv, *tv, now, lastblink, trigger;
+	struct timespec lastdraw = {0};
 	double timeout;
 
 	/* Waiting for window mapping */
@@ -2309,7 +2794,6 @@ run(void)
 				continue;
 			die("select failed: %s\n", strerror(errno));
 		}
-		clock_gettime(CLOCK_MONOTONIC, &now);
 
 		int ttyin = FD_ISSET(ttyfd, &rfd) || ttyread_pending();
 		if (ttyin)
@@ -2324,6 +2808,7 @@ run(void)
 			if (handler[ev.type])
 				(handler[ev.type])(&ev);
 		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
 
 		/*
 		 * To reduce flicker and tearing, when new content or event
@@ -2332,9 +2817,10 @@ run(void)
 		 * We start with trying to wait minlatency ms. If more content
 		 * arrives sooner, we retry with shorter and shorter periods,
 		 * and eventually draw even without idle after maxlatency ms.
-		 * Typically this results in low latency while interacting,
-		 * maximum latency intervals during `cat huge.txt`, and perfect
-		 * sync with periodic updates from animations/key-repeats/etc.
+		 * Sampling "now" after ttyread()/XPending() ensures that the
+		 * first batch starts the deadline cleanly (avoiding single-read
+		 * draw thrashing under X11 backpressure) while subsequent batches
+		 * still honor maxlatency accurately.
 		 */
 		if (ttyin || xev) {
 			if (!drawing) {
@@ -2359,6 +2845,18 @@ run(void)
 			continue;
 		}
 
+		/*
+		 * Draw at most xfps times per second. A frame costs the X server
+		 * a copy of the whole window (plus an encode of it on remote
+		 * displays such as ETX or VNC), and a fast wheel or touchpad can
+		 * otherwise ask for one frame per event. This delays a frame by
+		 * at most 1000/xfps ms, and only when frames come back to back.
+		 */
+		if (xfps && TIMEDIFF(now, lastdraw) < 1000.0 / xfps) {
+			timeout = 1000.0 / xfps - TIMEDIFF(now, lastdraw);
+			continue;
+		}
+
 		/* idle detected or maxlatency exhausted -> draw */
 		timeout = -1;
 		if (blinktimeout && tattrset(ATTR_BLINK)) {
@@ -2368,6 +2866,7 @@ run(void)
 					win.mode |= MODE_BLINK;
 				win.mode ^= MODE_BLINK;
 				tsetdirtattr(ATTR_BLINK);
+				xinvalidatedrawn();
 				lastblink = now;
 				timeout = blinktimeout;
 			}
@@ -2375,6 +2874,7 @@ run(void)
 
 		draw();
 		XFlush(xw.dpy);
+		lastdraw = now;
 		drawing = 0;
 	}
 }

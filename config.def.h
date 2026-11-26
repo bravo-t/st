@@ -82,7 +82,7 @@ int allowwindowops = 0;
  * low minlatency will tear/flicker more, as it can "detect" idle too early.
  */
 static double minlatency = 2;
-static double maxlatency = 33;
+static double maxlatency = 8;
 
 /*
  * Synchronized-Update timeout in ms
@@ -90,9 +90,20 @@ static double maxlatency = 33;
  */
 static uint su_timeout = 200;
 
-/* frames per second st should at maximum draw to the screen */
-static unsigned int xfps = 120;
+/* frames per second st should at maximum draw to the screen (0: no cap) */
+static unsigned int xfps = 0;
 static unsigned int actionfps = 30;
+
+/*
+ * Exceed TurboX (ETX) pacing. On an ETX display every frame is also
+ * encoded and sent to the remote client, so st draws less often there:
+ * these replace maxlatency and xfps above when st finds itself on an ETX
+ * X server (detected at startup by its HCL_ThinX extension). Every other
+ * display keeps the values above. To force the choice at build time, set
+ * ETXFLAGS in config.mk (-DETX=1: always, -DETX=0: never).
+ */
+static double etxmaxlatency = 33;
+static unsigned int etxxfps = 60;
 
 /*
  * blinking timeout (set to 0 to disable blinking) for the terminal blinking
@@ -425,6 +436,10 @@ static MouseShortcut mshortcuts[] = {
     { XK_ANY_MOD,           Button4, kscrollup,      {.i = 1},            0,       -1 },
     { XK_ANY_MOD,           Button5, kscrolldown,    {.i = 1},            0,       -1 },
 	{ XK_ANY_MOD,           Button2, selpaste,       {.i = 0},            1           },
+	{ Mod1Mask,             Button4, ttysend,        {.s = "\033[5~"},    0,        1 },
+	{ Mod1Mask,             Button5, ttysend,        {.s = "\033[6~"},    0,        1 },
+	{ ControlMask,          Button4, ttysend,        {.s = "\031\031\031\031\031"}, 0, 1 },
+	{ ControlMask,          Button5, ttysend,        {.s = "\005\005\005\005\005"}, 0, 1 },
 	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"}               },
 	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"}                    },
 	{ ShiftMask,            Button5, ttysend,        {.s = "\033[6;2~"}               },
@@ -590,9 +605,10 @@ static KeySym mappedkeys[] = {
 
 /*
  * State bits to ignore when matching key or button events.  By default,
- * numlock (Mod2Mask) and keyboard layout (XK_SWITCH_MOD) are ignored.
+ * numlock (Mod2Mask), capslock (LockMask), and keyboard layout
+ * (XK_SWITCH_MOD) are ignored.
  */
-static uint ignoremod = Mod2Mask|XK_SWITCH_MOD;
+static uint ignoremod = Mod2Mask|LockMask|XK_SWITCH_MOD;
 
 /*
  * This is the huge key array which defines all compatibility to the Linux
