@@ -1,5 +1,6 @@
 *.o
 st
+termbench
 patches
 config.h
 /compile_flags.txt
