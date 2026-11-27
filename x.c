@@ -305,11 +305,58 @@ static int xneeddraw = 0;
 static int xresetdrawthrottle = 0;
 static int win_urgent = 0;
 static int is_etx = 0;
+static int xdirect = 0; /* 1 on ETX with opaque (<32-bit) visual: draw directly to xw.win */
 static int dirty_x1 = 0, dirty_y1 = 0, dirty_x2 = 0, dirty_y2 = 0;
 #define MAX_DIRTY_RECTS 64
 static XRectangle dirty_rects[MAX_DIRTY_RECTS];
 static int ndirty_rects = 0;
 static int dirty_overflow = 0;
+
+/*
+ * Frame-wide XRender batching buffers: accumulate background rectangles,
+ * foreground text glyphs, box-drawing cells, and underline/strikethrough runs
+ * across all changed spans on all rows of a frame before flushing, so dense
+ * scattered updates (like vim hlsearch) emit O(unique_colors) XRender requests
+ * per frame without repainting unchanged cells between matches.
+ */
+enum {
+	MAX_BG_BUCKETS = 8,
+	BG_RECT_BATCH  = 1024,
+	MAX_FG_BUCKETS = 12,
+	FG_SPEC_BATCH  = 2048,
+	MAX_BOX_BUCKETS = 8,
+	BOX_SPEC_BATCH = 1024,
+	MAX_DECO_RUNS  = 512,
+};
+static int xbatch_active = 0;
+static Picture xbg_pic = None;
+static Color xbg_col[MAX_BG_BUCKETS];
+static XRectangle xbg_rects[MAX_BG_BUCKETS][BG_RECT_BATCH];
+static int xbg_cnt[MAX_BG_BUCKETS];
+static int xnbg_buckets = 0;
+
+static Color xfg_col[MAX_FG_BUCKETS];
+static XftGlyphFontSpec xfg_specs[MAX_FG_BUCKETS][FG_SPEC_BATCH];
+static int xfg_cnt[MAX_FG_BUCKETS];
+static size_t xfg_wire[MAX_FG_BUCKETS];
+static int xnfg_buckets = 0;
+
+static Color xbox_col[MAX_BOX_BUCKETS];
+static XftGlyphFontSpec xbox_specs[MAX_BOX_BUCKETS][BOX_SPEC_BATCH];
+static short xbox_winy[MAX_BOX_BUCKETS][BOX_SPEC_BATCH];
+static int xbox_cnt[MAX_BOX_BUCKETS];
+static int xnbox_buckets = 0;
+
+static struct { int x, y, w; Color col; } xdeco_runs[MAX_DECO_RUNS];
+static int xndeco = 0;
+static size_t xdirect_buf_est = 0; /* conservative bytes queued in libX11's 16 KB buffer */
+
+static void xbatch_flush_bg_bucket(int bi);
+static void xbatch_flush_bg(void);
+static void xbatch_flush_fg(void);
+static void xbatch_flush_all(void);
+static size_t xbatch_est_bytes(void);
+static void xdirect_flush_strip(void);
 
 static void
 xinvalidatedrawn(void)
@@ -938,10 +985,14 @@ xresize(int col, int row)
 	win.tw = col * win.cw;
 	win.th = row * win.ch;
 
-	XFreePixmap(xw.dpy, xw.buf);
-	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
-			xw.depth);
-	XftDrawChange(xw.draw, xw.buf);
+	if (xdirect) {
+		xw.buf = xw.win;
+	} else {
+		XFreePixmap(xw.dpy, xw.buf);
+		xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
+				xw.depth);
+		XftDrawChange(xw.draw, xw.buf);
+	}
 	xclear(0, 0, win.w, win.h);
 
 	/* resize to new width */
@@ -1667,12 +1718,25 @@ xinit(int cols, int rows)
 	if (parent != root)
 		XReparentWindow(xw.dpy, xw.win, parent, xw.l, xw.t);
 
+	/*
+	 * On ETX with an opaque (<32-bit) visual, render directly onto xw.win
+	 * instead of an offscreen pixmap + XCopyArea. This avoids etxproxy's
+	 * ShadowCopyAny synchronous FlushShadow + 18 MB sse2_blt + OpenMP
+	 * WalkPrevDrawHash per frame, and lets etxproxy track only the actual
+	 * changed spans (or forward XRender via ThinX vector ops).
+	 */
+	xdirect = (is_etx && xw.depth < 32);
 	memset(&gcvalues, 0, sizeof(gcvalues));
 	gcvalues.graphics_exposures = False;
-    xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h, xw.depth);
-    dc.gc = XCreateGC(xw.dpy, xw.buf, GCGraphicsExposures, &gcvalues);
-	XSetForeground(xw.dpy, dc.gc, dc.col[seloptsch->defaultbg].pixel);
-	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
+	if (xdirect) {
+		xw.buf = xw.win;
+		dc.gc = XCreateGC(xw.dpy, xw.win, GCGraphicsExposures, &gcvalues);
+	} else {
+		xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h, xw.depth);
+		dc.gc = XCreateGC(xw.dpy, xw.buf, GCGraphicsExposures, &gcvalues);
+		XSetForeground(xw.dpy, dc.gc, dc.col[seloptsch->defaultbg].pixel);
+		XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
+	}
 
 	/* font spec buffer */
 	xw.specbuf = xmalloc(cols * sizeof(GlyphFontSpec));
@@ -2458,7 +2522,7 @@ xdrawscreen(Line *lines, int col, int row, int showcursor, int cx, int cy, int h
 				cur_row_same[y] = 0;
 			}
 		}
-		if (matches0 < row - 2)
+		if (!xdirect && matches0 < row - 2)
 			best_d = xfindscroll(lines, col, row, matches0);
 	}
 
@@ -2480,6 +2544,8 @@ xdrawscreen(Line *lines, int col, int row, int showcursor, int cx, int cy, int h
 		} else {
 			Glyph og = drawn_buf[(size_t)prev_cy * col + prev_cx];
 			xdrawglyph(og, prev_cx, prev_cy);
+			if (xdirect)
+				xdirect_buf_est += 256;
 			xdirtycells(prev_cx, prev_cy,
 			            prev_cx + ((og.mode & ATTR_WIDE) ? 2 : 1),
 			            prev_cy + 1, col, row);
@@ -2538,6 +2604,12 @@ xdrawscreen(Line *lines, int col, int row, int showcursor, int cx, int cy, int h
 	}
 
 	/* Redraw only rows (and column spans) that actually changed. */
+	xbatch_active = 1;
+	xbg_pic = XftDrawPicture(xw.draw);
+	xnbg_buckets = 0;
+	xnfg_buckets = 0;
+	xnbox_buckets = 0;
+	xndeco = 0;
 	for (y = 0; y < row; y++) {
 		const Glyph *src = lines[y];
 		Glyph *dst = &drawn_buf[(size_t)y * col];
@@ -2566,7 +2638,8 @@ xdrawscreen(Line *lines, int col, int row, int showcursor, int cx, int cy, int h
 			/*
 			 * Diff changed column spans, splitting across unchanged gaps
 			 * >= 16 cells so distant edits on wide rows don't repaint
-			 * everything in between.
+			 * unchanged cells in between. Frame-wide batching merges
+			 * bg rects and fg glyphs across all spans and rows.
 			 */
 			int pos = 0;
 			while (pos < col) {
@@ -2598,11 +2671,20 @@ xdrawscreen(Line *lines, int col, int row, int showcursor, int cx, int cy, int h
 			memcpy(dst, src, rowbytes);
 			drawn_hash[y] = (!hassel && row >= 4) ? cur_hash[y] : xrowhash(src, col);
 		}
+		if (xdirect && xbatch_est_bytes() >= 4096)
+			xdirect_flush_strip();
 	}
+	if (xdirect)
+		xdirect_flush_strip();
+	else
+		xbatch_flush_all();
+	xbatch_active = 0;
 	drawn_valid = 1;
 
 	if (showcursor && !cursor_kept && !IS_SET(MODE_HIDE)) {
 		xdrawcursor_at(cx, cy, lines[cy][cx]);
+		if (xdirect)
+			xdirect_buf_est += 256;
 		prev_cursor_drawn = 1;
 		prev_cx = cx;
 		prev_cy = cy;
@@ -2745,6 +2827,110 @@ xresolvecolors(Glyph base, int need_fg, int need_bg,
 	if (bgp) *bgp = bg;
 }
 
+static void
+xbatch_flush_bg_bucket(int bi)
+{
+	if (xbg_cnt[bi] <= 0)
+		return;
+	if (xbg_pic != None) {
+		XRenderFillRectangles(xw.dpy, PictOpSrc, xbg_pic, &xbg_col[bi].color,
+		                      xbg_rects[bi], xbg_cnt[bi]);
+	} else {
+		for (int k = 0; k < xbg_cnt[bi]; k++)
+			XftDrawRect(xw.draw, &xbg_col[bi], xbg_rects[bi][k].x, xbg_rects[bi][k].y,
+			            xbg_rects[bi][k].width, xbg_rects[bi][k].height);
+	}
+	xbg_cnt[bi] = 0;
+}
+
+static void
+xbatch_flush_bg(void)
+{
+	for (int bi = 0; bi < xnbg_buckets; bi++)
+		xbatch_flush_bg_bucket(bi);
+	xnbg_buckets = 0;
+}
+
+static void
+xbatch_flush_fg(void)
+{
+	/* Always ensure queued backgrounds are painted underneath before any foreground. */
+	xbatch_flush_bg();
+	for (int fi = 0; fi < xnfg_buckets; fi++) {
+		if (xfg_cnt[fi] > 0) {
+			XftDrawGlyphFontSpec(xw.draw, &xfg_col[fi], xfg_specs[fi], xfg_cnt[fi]);
+			xfg_cnt[fi] = 0;
+			xfg_wire[fi] = 0;
+		}
+	}
+	xnfg_buckets = 0;
+	for (int bi = 0; bi < xnbox_buckets; bi++) {
+		if (xbox_cnt[bi] > 0) {
+			/* Group box specs by row y (drawboxes_at takes a single y) */
+			int start = 0;
+			while (start < xbox_cnt[bi]) {
+				int end = start + 1;
+				short sy = xbox_winy[bi][start];
+				while (end < xbox_cnt[bi] && xbox_winy[bi][end] == sy)
+					end++;
+				drawboxes_at(sy, win.cw, win.ch,
+				             &xbox_col[bi], NULL, &xbox_specs[bi][start], end - start);
+				start = end;
+			}
+			xbox_cnt[bi] = 0;
+		}
+	}
+	xnbox_buckets = 0;
+	for (int di = 0; di < xndeco; di++) {
+		XftDrawRect(xw.draw, &xdeco_runs[di].col,
+		            xdeco_runs[di].x, xdeco_runs[di].y, xdeco_runs[di].w, 1);
+	}
+	xndeco = 0;
+}
+
+static void
+xbatch_flush_all(void)
+{
+	xbatch_flush_fg();
+}
+
+/* Accurate X11 wire-byte estimate for the currently queued batch. */
+static size_t
+xbatch_est_bytes(void)
+{
+	size_t est = 0;
+	for (int bi = 0; bi < xnbg_buckets; bi++)
+		if (xbg_cnt[bi] > 0)
+			est += 20 + (size_t)xbg_cnt[bi] * 8;
+	for (int fi = 0; fi < xnfg_buckets; fi++)
+		if (xfg_cnt[fi] > 0)
+			est += 40 + xfg_wire[fi];
+	for (int bi = 0; bi < xnbox_buckets; bi++)
+		if (xbox_cnt[bi] > 0)
+			est += 40 + (size_t)xbox_cnt[bi] * 24;
+	est += (size_t)xndeco * 28;
+	return est;
+}
+
+/*
+ * In direct-to-window ETX mode, align libX11 flushes to complete (bg + fg)
+ * strips so a 16 KB libX11 auto-flush never splits a strip between
+ * XRenderFillRectangles (blank bg) and XftDrawGlyphFontSpec (text).
+ */
+static void
+xdirect_flush_strip(void)
+{
+	size_t est = xbatch_est_bytes();
+	if (est == 0)
+		return;
+	if (xdirect_buf_est > 0 && xdirect_buf_est + est > 11000) {
+		XFlush(xw.dpy);
+		xdirect_buf_est = 0;
+	}
+	xbatch_flush_all();
+	xdirect_buf_est += est;
+}
+
 void
 xdrawline(Line line, int x1, int y1, int x2)
 {
@@ -2753,6 +2939,15 @@ xdrawline(Line line, int x1, int y1, int x2)
 	int winx1 = win.hborderpx + x1 * win.cw;
 	int winx2 = win.hborderpx + x2 * win.cw;
 	XftGlyphFontSpec *specs = xw.specbuf;
+	int local_batch = !xbatch_active;
+
+	if (local_batch) {
+		xbg_pic = XftDrawPicture(xw.draw);
+		xnbg_buckets = 0;
+		xnfg_buckets = 0;
+		xnbox_buckets = 0;
+		xndeco = 0;
+	}
 
 	numspecs = xmakeglyphfontspecs(specs, &line[x1], x2 - x1, x1, y1);
 
@@ -2777,6 +2972,39 @@ xdrawline(Line line, int x1, int y1, int x2)
 		uint32_t fast_bg = 0;
 		int fast_valid = 0;
 
+#define EMIT_BG_RUN(rx, rcols, rcolp) do { \
+	int _px = win.hborderpx + (rx) * win.cw; \
+	int _pw = (rcols) * win.cw; \
+	int _bi; \
+	for (_bi = 0; _bi < xnbg_buckets; _bi++) { \
+		if (xcoloreq(&xbg_col[_bi], (rcolp))) \
+			break; \
+	} \
+	if (_bi == xnbg_buckets) { \
+		if (xnbg_buckets < MAX_BG_BUCKETS) { \
+			xbg_col[_bi] = *(rcolp); \
+			xbg_cnt[_bi] = 0; \
+			xnbg_buckets++; \
+		} else { \
+			/* Evict fullest bg bucket to keep batching without ordering hazards */ \
+			int _best = 0; \
+			for (int _k = 1; _k < MAX_BG_BUCKETS; _k++) \
+				if (xbg_cnt[_k] > xbg_cnt[_best]) _best = _k; \
+			xbatch_flush_bg_bucket(_best); \
+			_bi = _best; \
+			xbg_col[_bi] = *(rcolp); \
+			xbg_cnt[_bi] = 0; \
+		} \
+	} \
+	if (xbg_cnt[_bi] >= BG_RECT_BATCH) \
+		xbatch_flush_bg_bucket(_bi); \
+	xbg_rects[_bi][xbg_cnt[_bi]].x = (short)_px; \
+	xbg_rects[_bi][xbg_cnt[_bi]].y = (short)winy; \
+	xbg_rects[_bi][xbg_cnt[_bi]].width = (unsigned short)_pw; \
+	xbg_rects[_bi][xbg_cnt[_bi]].height = (unsigned short)win.ch; \
+	xbg_cnt[_bi]++; \
+} while (0)
+
 		for (x = x1; x < x2; x++) {
 			Glyph g = line[x];
 			int cw_cells;
@@ -2795,9 +3023,7 @@ xdrawline(Line line, int x1, int y1, int x2)
 				run_cols += cw_cells;
 			} else {
 				if (run_cols > 0)
-					XftDrawRect(xw.draw, run_bg,
-					            win.hborderpx + run_x * win.cw, winy,
-					            run_cols * win.cw, win.ch);
+					EMIT_BG_RUN(run_x, run_cols, run_bg);
 				run_x = x;
 				run_cols = cw_cells;
 				run_bg_val = *cbg;
@@ -2811,40 +3037,33 @@ xdrawline(Line line, int x1, int y1, int x2)
 			}
 		}
 		if (run_cols > 0)
-			XftDrawRect(xw.draw, run_bg,
-			            win.hborderpx + run_x * win.cw, winy,
-			            run_cols * win.cw, win.ch);
+			EMIT_BG_RUN(run_x, run_cols, run_bg);
+#undef EMIT_BG_RUN
 	}
 
 	/*
-	 * Pass 2: draw foreground. Batch consecutive same-fg text glyphs across
-	 * spaces, bold/italic changes, background changes, and box-drawing cells,
-	 * and bucket box-drawing cells by fg color so an entire table row's │
-	 * bars or ──── rule flushes in one XRenderFillRectangles() call per color.
+	 * Pass 2: accumulate foreground text glyphs, box-drawing cells, and
+	 * underline/strikethrough runs into frame-wide color buckets.
 	 */
 	{
-		XftGlyphFontSpec fg_stack[512];
-		XftGlyphFontSpec *fgbuf = (numspecs <= (int)LEN(fg_stack))
-		    ? fg_stack : xmalloc((size_t)numspecs * sizeof(*fgbuf));
-		int nfg = 0;
-		Color fg_cur;
-
-		enum { MAX_BOX_BUCKETS = 8 };
-		Color box_col[MAX_BOX_BUCKETS];
-		static XftGlyphFontSpec box_specs[MAX_BOX_BUCKETS][512];
-		int box_cnt[MAX_BOX_BUCKETS];
-		int nbox_buckets = 0;
-
 		Color truefg, truebg, revfg, revbg;
-		Glyph prev_g;
+		Glyph prev_g = {0};
 		Color prev_fg_val, prev_bg_val;
 		int prev_g_valid = 0, prev_g_had_bg = 0;
 		int ul_start = -1, st_start = -1;
 		Color ul_col, st_col;
-		struct { int x, w; Color col; } ul_runs[64], st_runs[64];
-		int nul = 0, nst = 0;
 		int ul_y = winy + win.cyo + dc.font.ascent * chscale + 1;
 		int st_y = winy + win.cyo + 2 * dc.font.ascent * chscale / 3;
+
+#define EMIT_DECO(dx, dy, dw, dcol) do { \
+	if (xndeco >= MAX_DECO_RUNS) \
+		xbatch_flush_fg(); \
+	xdeco_runs[xndeco].x = (dx); \
+	xdeco_runs[xndeco].y = (dy); \
+	xdeco_runs[xndeco].w = (dw); \
+	xdeco_runs[xndeco].col = (dcol); \
+	xndeco++; \
+} while (0)
 
 		for (x = x1, specidx = 0; x < x2 && specidx < numspecs; x++) {
 			Glyph g = line[x];
@@ -2863,27 +3082,11 @@ xdrawline(Line line, int x1, int y1, int x2)
 			if (!is_box && !specs[specidx].font &&
 			    !(g.mode & (ATTR_UNDERLINE | ATTR_STRUCK))) {
 				if (ul_start >= 0) {
-					if (nul < (int)LEN(ul_runs)) {
-						ul_runs[nul].x = win.hborderpx + ul_start * win.cw;
-						ul_runs[nul].w = (x - ul_start) * win.cw;
-						ul_runs[nul].col = ul_col;
-						nul++;
-					} else {
-						if (nfg > 0) { XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg); nfg = 0; }
-						XftDrawRect(xw.draw, &ul_col, win.hborderpx + ul_start * win.cw, ul_y, (x - ul_start) * win.cw, 1);
-					}
+					EMIT_DECO(win.hborderpx + ul_start * win.cw, ul_y, (x - ul_start) * win.cw, ul_col);
 					ul_start = -1;
 				}
 				if (st_start >= 0) {
-					if (nst < (int)LEN(st_runs)) {
-						st_runs[nst].x = win.hborderpx + st_start * win.cw;
-						st_runs[nst].w = (x - st_start) * win.cw;
-						st_runs[nst].col = st_col;
-						nst++;
-					} else {
-						if (nfg > 0) { XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg); nfg = 0; }
-						XftDrawRect(xw.draw, &st_col, win.hborderpx + st_start * win.cw, st_y, (x - st_start) * win.cw, 1);
-					}
+					EMIT_DECO(win.hborderpx + st_start * win.cw, st_y, (x - st_start) * win.cw, st_col);
 					st_start = -1;
 				}
 				specidx++;
@@ -2910,55 +3113,89 @@ xdrawline(Line line, int x1, int y1, int x2)
 
 			if (is_box) {
 				if (need_bg_here) {
+					xbatch_flush_bg();
 					drawboxes_at(winy, cw_cells * win.cw, win.ch, cfg, cbg,
 					             &specs[specidx], 1);
 				} else {
 					int bi;
-					for (bi = 0; bi < nbox_buckets; bi++) {
-						if (xcoloreq(&box_col[bi], cfg))
+					for (bi = 0; bi < xnbox_buckets; bi++) {
+						if (xcoloreq(&xbox_col[bi], cfg))
 							break;
 					}
-					if (bi == nbox_buckets) {
-						if (nbox_buckets < MAX_BOX_BUCKETS) {
-							box_col[bi] = *cfg;
-							box_cnt[bi] = 0;
-							nbox_buckets++;
+					if (bi == xnbox_buckets) {
+						if (xnbox_buckets < MAX_BOX_BUCKETS) {
+							xbox_col[bi] = *cfg;
+							xbox_cnt[bi] = 0;
+							xnbox_buckets++;
 						} else {
-							drawboxes_at(winy, cw_cells * win.cw, win.ch, cfg, cbg,
-							             &specs[specidx], 1);
-							bi = -1;
+							xbatch_flush_fg();
+							bi = 0;
+							xbox_col[bi] = *cfg;
+							xbox_cnt[bi] = 0;
+							xnbox_buckets = 1;
 						}
 					}
-					if (bi >= 0) {
-						if (box_cnt[bi] >= 512) {
-							drawboxes_at(winy, win.cw, win.ch, &box_col[bi], NULL,
-							             box_specs[bi], box_cnt[bi]);
-							box_cnt[bi] = 0;
-						}
-						box_specs[bi][box_cnt[bi]++] = specs[specidx];
+					if (xbox_cnt[bi] >= BOX_SPEC_BATCH) {
+						xbatch_flush_fg();
+						bi = 0;
+						xbox_col[bi] = *cfg;
+						xbox_cnt[bi] = 0;
+						xnbox_buckets = 1;
 					}
+					xbox_winy[bi][xbox_cnt[bi]] = (short)winy;
+					xbox_specs[bi][xbox_cnt[bi]++] = specs[specidx];
 				}
 			} else if (specs[specidx].font) {
-				if (nfg > 0 && !xcoloreq(&fg_cur, cfg)) {
-					XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg);
-					nfg = 0;
+				int fi;
+				for (fi = 0; fi < xnfg_buckets; fi++) {
+					if (xcoloreq(&xfg_col[fi], cfg))
+						break;
 				}
-				if (nfg == 0)
-					fg_cur = *cfg;
-				fgbuf[nfg++] = specs[specidx];
+				if (fi == xnfg_buckets) {
+					if (xnfg_buckets < MAX_FG_BUCKETS) {
+						xfg_col[fi] = *cfg;
+						xfg_cnt[fi] = 0;
+						xfg_wire[fi] = 0;
+						xnfg_buckets++;
+					} else {
+						/* Flush backgrounds first, then evict fullest fg bucket */
+						xbatch_flush_bg();
+						int best = 0;
+						for (int k = 1; k < MAX_FG_BUCKETS; k++)
+							if (xfg_cnt[k] > xfg_cnt[best]) best = k;
+						if (xfg_cnt[best] > 0)
+							XftDrawGlyphFontSpec(xw.draw, &xfg_col[best],
+							                     xfg_specs[best], xfg_cnt[best]);
+						fi = best;
+						xfg_col[fi] = *cfg;
+						xfg_cnt[fi] = 0;
+						xfg_wire[fi] = 0;
+					}
+				}
+				if (xfg_cnt[fi] >= FG_SPEC_BATCH) {
+					xbatch_flush_bg();
+					XftDrawGlyphFontSpec(xw.draw, &xfg_col[fi], xfg_specs[fi], xfg_cnt[fi]);
+					xfg_cnt[fi] = 0;
+					xfg_wire[fi] = 0;
+				}
+				if (xfg_cnt[fi] > 0) {
+					const XftGlyphFontSpec *prev = &xfg_specs[fi][xfg_cnt[fi] - 1];
+					if (prev->font == specs[specidx].font &&
+					    prev->y == specs[specidx].y &&
+					    specs[specidx].x >= prev->x &&
+					    specs[specidx].x <= prev->x + 2 * win.cw)
+						xfg_wire[fi] += 2;
+					else
+						xfg_wire[fi] += 12;
+				} else {
+					xfg_wire[fi] += 12;
+				}
+				xfg_specs[fi][xfg_cnt[fi]++] = specs[specidx];
 			}
 
 			if (g.mode & ATTR_UNDERLINE) {
 				if (ul_start >= 0 && !xcoloreq(&ul_col, cfg)) {
-					if (nul < (int)LEN(ul_runs)) {
-						ul_runs[nul].x = win.hborderpx + ul_start * win.cw;
-						ul_runs[nul].w = (x - ul_start) * win.cw;
-						ul_runs[nul].col = ul_col;
-						nul++;
-					} else {
-						if (nfg > 0) { XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg); nfg = 0; }
-						XftDrawRect(xw.draw, &ul_col, win.hborderpx + ul_start * win.cw, ul_y, (x - ul_start) * win.cw, 1);
-					}
+					EMIT_DECO(win.hborderpx + ul_start * win.cw, ul_y, (x - ul_start) * win.cw, ul_col);
 					ul_start = -1;
 				}
 				if (ul_start < 0) {
@@ -2966,29 +3203,13 @@ xdrawline(Line line, int x1, int y1, int x2)
 					ul_col = *cfg;
 				}
 			} else if (ul_start >= 0) {
-				if (nul < (int)LEN(ul_runs)) {
-					ul_runs[nul].x = win.hborderpx + ul_start * win.cw;
-					ul_runs[nul].w = (x - ul_start) * win.cw;
-					ul_runs[nul].col = ul_col;
-					nul++;
-				} else {
-					if (nfg > 0) { XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg); nfg = 0; }
-					XftDrawRect(xw.draw, &ul_col, win.hborderpx + ul_start * win.cw, ul_y, (x - ul_start) * win.cw, 1);
-				}
+				EMIT_DECO(win.hborderpx + ul_start * win.cw, ul_y, (x - ul_start) * win.cw, ul_col);
 				ul_start = -1;
 			}
 
 			if (g.mode & ATTR_STRUCK) {
 				if (st_start >= 0 && !xcoloreq(&st_col, cfg)) {
-					if (nst < (int)LEN(st_runs)) {
-						st_runs[nst].x = win.hborderpx + st_start * win.cw;
-						st_runs[nst].w = (x - st_start) * win.cw;
-						st_runs[nst].col = st_col;
-						nst++;
-					} else {
-						if (nfg > 0) { XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg); nfg = 0; }
-						XftDrawRect(xw.draw, &st_col, win.hborderpx + st_start * win.cw, st_y, (x - st_start) * win.cw, 1);
-					}
+					EMIT_DECO(win.hborderpx + st_start * win.cw, st_y, (x - st_start) * win.cw, st_col);
 					st_start = -1;
 				}
 				if (st_start < 0) {
@@ -2996,52 +3217,36 @@ xdrawline(Line line, int x1, int y1, int x2)
 					st_col = *cfg;
 				}
 			} else if (st_start >= 0) {
-				if (nst < (int)LEN(st_runs)) {
-					st_runs[nst].x = win.hborderpx + st_start * win.cw;
-					st_runs[nst].w = (x - st_start) * win.cw;
-					st_runs[nst].col = st_col;
-					nst++;
-				} else {
-					if (nfg > 0) { XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg); nfg = 0; }
-					XftDrawRect(xw.draw, &st_col, win.hborderpx + st_start * win.cw, st_y, (x - st_start) * win.cw, 1);
-				}
+				EMIT_DECO(win.hborderpx + st_start * win.cw, st_y, (x - st_start) * win.cw, st_col);
 				st_start = -1;
 			}
 
 			specidx++;
 		}
 
-		if (nfg > 0)
-			XftDrawGlyphFontSpec(xw.draw, &fg_cur, fgbuf, nfg);
-		for (int bi = 0; bi < nbox_buckets; bi++) {
-			if (box_cnt[bi] > 0)
-				drawboxes_at(winy, win.cw, win.ch, &box_col[bi], NULL,
-				             box_specs[bi], box_cnt[bi]);
-		}
-		for (int ui = 0; ui < nul; ui++)
-			XftDrawRect(xw.draw, &ul_runs[ui].col, ul_runs[ui].x, ul_y, ul_runs[ui].w, 1);
-		if (ul_start >= 0) {
-			XftDrawRect(xw.draw, &ul_col,
-			            win.hborderpx + ul_start * win.cw, ul_y,
-			            (x2 - ul_start) * win.cw, 1);
-		}
-		for (int si = 0; si < nst; si++)
-			XftDrawRect(xw.draw, &st_runs[si].col, st_runs[si].x, st_y, st_runs[si].w, 1);
-		if (st_start >= 0) {
-			XftDrawRect(xw.draw, &st_col,
-			            win.hborderpx + st_start * win.cw, st_y,
-			            (x2 - st_start) * win.cw, 1);
-		}
-		if (fgbuf != fg_stack)
-			free(fgbuf);
+		if (ul_start >= 0)
+			EMIT_DECO(win.hborderpx + ul_start * win.cw, ul_y, (x2 - ul_start) * win.cw, ul_col);
+		if (st_start >= 0)
+			EMIT_DECO(win.hborderpx + st_start * win.cw, st_y, (x2 - st_start) * win.cw, st_col);
+#undef EMIT_DECO
+		if (local_batch)
+			xbatch_flush_all();
 	}
 }
 
 void
 xfinishdraw(void)
 {
+	if (xdirect)
+		return;
 	if (dirty_x1 < dirty_x2 && dirty_y1 < dirty_y2) {
-		if (!dirty_overflow && ndirty_rects > 0) {
+		/*
+		 * On ETX, every XCopyArea(xw.buf -> xw.win) triggers etxproxy's
+		 * ShadowCopyAny -> synchronous FlushShadow + OpenMP WalkPrevDrawHash,
+		 * so always coalesce into 1 bounding-box copy. On local X11, keep
+		 * multi-rect blits only for sparse (<= 4 rect) updates.
+		 */
+		if (!is_etx && !dirty_overflow && ndirty_rects > 0 && ndirty_rects <= 4) {
 			int i;
 			for (i = 0; i < ndirty_rects; i++) {
 				XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc,
@@ -3074,6 +3279,29 @@ void
 expose(XEvent *ev)
 {
 	XExposeEvent *e = &ev->xexpose;
+
+	if (xdirect) {
+		if (drawn_valid && drawn_row_valid && e->width > 0 && e->height > 0) {
+			int y1 = (e->y - win.vborderpx) / win.ch;
+			int y2 = (e->y + e->height - 1 - win.vborderpx) / win.ch;
+			LIMIT(y1, 0, drawn_row - 1);
+			LIMIT(y2, 0, drawn_row - 1);
+			for (int y = y1; y <= y2; y++)
+				drawn_row_valid[y] = 0;
+			if (prev_cursor_drawn && prev_cy >= y1 && prev_cy <= y2)
+				prev_cursor_drawn = 0;
+			if (win.hborderpx > 0 || win.vborderpx > 0)
+				xclear(e->x, e->y, e->x + e->width, e->y + e->height);
+		} else {
+			xinvalidatedrawn();
+		}
+		if (e->count == 0) {
+			redraw();
+			XFlush(xw.dpy);
+			xdirect_buf_est = 0;
+		}
+		return;
+	}
 
 	if (drawn_valid) {
 		/* xw.buf already holds the current frame: blit the exposed area
@@ -3582,6 +3810,7 @@ run(void)
 
 		draw();
 		XFlush(xw.dpy);
+		xdirect_buf_est = 0;
 		lastdraw = now;
 		drawing = 0;
 	}
