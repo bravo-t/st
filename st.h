@@ -111,6 +111,7 @@ void toggleprinter(const Arg *);
 
 int tattrset(int);
 int tisaltscr(void);
+int tscr_pinned(void);
 void tnew(int, int);
 void tresize(int, int);
 void tsetdirtattr(int);

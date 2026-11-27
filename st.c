@@ -159,6 +159,7 @@ typedef struct {
     int histcol[HISTSIZE]; /* stored (trimmed) width of each history line */
     HistSlab *histslab[HISTSIZE]; /* slab owning hist[i], or NULL if heap */
     uchar histfmt[HISTSIZE]; /* enum hist_fmt */
+    uint64_t hist_seq;   /* monotonic count of lines pushed into history */
     int histi;           /* history index */
     int scr;             /* history scroll back */
     int histwcount;      /* how many lines have been written */
@@ -287,6 +288,12 @@ static HistSlab *histslab_cur = NULL;
 static HistSlab *histslab_spare = NULL;
 static int hist_heap_count = 0;
 static uchar hist_empty_line = 0;
+static uint64_t hist_gen = 0;
+static int drawn_hist_valid = 0;
+static uint64_t drawn_hist_top = 0;
+static uint64_t drawn_hist_gen = 0;
+static int drawn_hist_col = 0;
+static int drawn_hist_row = 0;
 static unsigned int xmode_shadow = 0;
 
 static inline void
@@ -534,6 +541,7 @@ selstart(int col, int row, int snap)
 	sel.oe.x = sel.ob.x = col;
 	sel.oe.y = sel.ob.y = row;
 	selnormalize();
+	drawn_hist_valid = 0;
 
 	if (sel.snap != 0)
 		sel.mode = SEL_READY;
@@ -561,6 +569,7 @@ selextend(int col, int row, int type, int done)
 	sel.oe.x = col;
 	sel.oe.y = row;
 	selnormalize();
+	drawn_hist_valid = 0;
 	sel.type = type;
 
 	if (oldey != sel.oe.y || oldex != sel.oe.x || oldtype != sel.type || sel.mode == SEL_EMPTY)
@@ -748,6 +757,7 @@ selclear(void)
 		return;
 	sel.mode = SEL_IDLE;
 	sel.ob.x = -1;
+	drawn_hist_valid = 0;
 	tsetdirt(sel.nb.y, sel.ne.y);
 }
 
@@ -1185,6 +1195,7 @@ tsetdirtattr(int attr)
 void
 tfulldirt(void)
 {
+	drawn_hist_valid = 0;
 	tsync_end();
 	tsetdirt(0, term.row-1);
 }
@@ -1240,6 +1251,8 @@ void
 tnew(int col, int row)
 {
 	thistclear();
+	hist_gen++;
+	drawn_hist_valid = 0;
 	xmode_shadow = 0;
 	term = (Term){ .c = { .attr = { .fg = seloptsch->defaultfg, .bg = seloptsch->defaultbg } } };
 	tresize(col, row);
@@ -1249,6 +1262,25 @@ tnew(int col, int row)
 int tisaltscr(void)
 {
     return IS_SET(MODE_ALTSCREEN);
+}
+
+/*
+ * True when the last completed draw() painted pure scrollback history
+ * (term.scr >= term.row, primary screen, no active selection) and the exact
+ * visible history range has not moved or been invalidated since.
+ */
+int
+tscr_pinned(void)
+{
+	return drawn_hist_valid &&
+	       !IS_SET(MODE_ALTSCREEN) &&
+	       term.scr >= term.row &&
+	       term.col == drawn_hist_col &&
+	       term.row == drawn_hist_row &&
+	       hist_gen == drawn_hist_gen &&
+	       (term.hist_seq - (uint64_t)term.scr) == drawn_hist_top &&
+	       (sel.mode == SEL_EMPTY || sel.ob.x == -1 ||
+	        sel.alt != IS_SET(MODE_ALTSCREEN));
 }
 
 void
@@ -1489,6 +1521,9 @@ thistclear(void)
 		memset(term.histfmt, 0, sizeof(term.histfmt));
 		term.histwcount = 0;
 		term.histi = 0;
+		term.hist_seq = 0;
+		hist_gen++;
+		drawn_hist_valid = 0;
 		if (term.scr > 0) {
 			term.scr = 0;
 			tfulldirt();
@@ -1741,6 +1776,8 @@ tscrolldown(int orig, int n, int copyhist)
 	if (copyhist) {
 		term.histi = (term.histi - 1 + HISTSIZE) % HISTSIZE;
 		thistpush(term.histi, term.line[term.bot], term.rowmax[term.bot]);
+		hist_gen++;
+		drawn_hist_valid = 0;
 		/*
 		 * The visible history window [histi-histwcount+1, histi] just
 		 * moved back one slot. Unless the ring is full, its new oldest
@@ -1788,6 +1825,7 @@ tscrollup(int orig, int n, int copyhist)
 	if (copyhist) {
 		term.histi = (term.histi + 1) % HISTSIZE;
 		thistpush(term.histi, term.line[orig], term.rowmax[orig]);
+		term.hist_seq++;
 		if (term.histwcount < HISTSIZE)
 			term.histwcount++;
 	}
@@ -4159,6 +4197,7 @@ twrite_bulk(const char *s, int len, int *fail_off)
 		}
 		if (term.scr > 0 && term.scr < HISTSIZE)
 			term.scr = MIN(term.scr + k, MIN(term.histwcount, HISTSIZE - 1));
+		term.hist_seq += (uint64_t)k;
 	}
 
 	/* Step 2: Populate ONLY the final visible screen rows (k >= rows > vis). */
@@ -4526,6 +4565,8 @@ tresize(int col, int row)
 	/* update terminal size */
 	term.col = col;
 	term.row = row;
+	hist_gen++;
+	drawn_hist_valid = 0;
 	/* reset scrolling region */
 	tsetscroll(0, row-1);
 	/* make use of the LIMIT in tmoveto */
@@ -4561,8 +4602,10 @@ draw(void)
 	int y, hassel;
 	int cx = term.c.x, ocx = term.ocx, ocy = term.ocy;
 
-	if (!xstartdraw())
+	if (!xstartdraw()) {
+		drawn_hist_valid = 0;
 		return;
+	}
 
 	/* adjust cursor position */
 	LIMIT(term.ocx, 0, term.col-1);
@@ -4594,6 +4637,15 @@ draw(void)
 	xdrawscreen(vislines, term.col, term.row, term.scr == 0, cx, term.c.y, hassel);
 	term.ocx = cx, term.ocy = term.c.y;
 	xfinishdraw();
+	if (!IS_SET(MODE_ALTSCREEN) && term.scr >= term.row && !hassel) {
+		drawn_hist_valid = 1;
+		drawn_hist_top = term.hist_seq - (uint64_t)term.scr;
+		drawn_hist_gen = hist_gen;
+		drawn_hist_col = term.col;
+		drawn_hist_row = term.row;
+	} else {
+		drawn_hist_valid = 0;
+	}
 	if (ocx != term.ocx || ocy != term.ocy)
 		xximspot(term.ocx, term.ocy);
 }

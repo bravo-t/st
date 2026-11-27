@@ -3482,6 +3482,14 @@ run(void)
 		double eff_maxlat;
 		unsigned int eff_xfps;
 		xactivepacing(&eff_maxlat, &eff_xfps);
+		/*
+		 * When the entire visible window is pinned in scrollback history
+		 * (term.scr >= term.row) and incoming PTY data did not shift or
+		 * evict those rows, bypass draw()/XFlush()/maxlatency timers
+		 * completely until an X event, scroll, or ring overflow occurs.
+		 */
+		int drawin = ttyin &&
+		             !(!xev && !cursor_dirty && drawn_valid && tscr_pinned());
 
 		/*
 		 * To reduce flicker and tearing, when new content or event
@@ -3500,7 +3508,7 @@ run(void)
 		 * frame can be presented before a queued BSU, draw now instead
 		 * of looping back and immediately consuming the next BSU.
 		 */
-		if ((ttyin || xev) && !ttyread_pending()) {
+		if ((drawin || xev) && !ttyread_pending()) {
 			if (!drawing) {
 				trigger = now;
 				drawing = 1;
@@ -3510,7 +3518,7 @@ run(void)
 			if (timeout > 0)
 				continue;  /* we have time, try to find idle */
 		}
-		if (!drawing && !ttyin && !xev && !cursor_dirty && drawn_valid &&
+		if (!drawing && !drawin && !xev && !cursor_dirty && drawn_valid &&
 		    !(blinktimeout && tattrset(ATTR_BLINK))) {
 			timeout = -1;
 			continue;
