@@ -13,7 +13,7 @@ Originally, this fork combined common community patches (1,000,000-line lazy scr
 
 ## Key Improvements (Since `5b3983e`)
 
-Starting from commit `5b3983e35510e2c28bd594061eeb4a42d283d92a` through `92d8896`, `st` was profiled and redesigned across PTY ingestion, scrollback storage, X11 rendering, draw pacing, and protocol handling:
+Starting from commit `5b3983e35510e2c28bd594061eeb4a42d283d92a` through `a9a5021`, `st` was profiled and redesigned across PTY ingestion, scrollback storage, X11/ETX rendering, draw pacing, and protocol handling:
 
 ### 1. PTY Reading, Parsing & Flood-Only Direct-to-History Fast Path
 - **64 KB non-blocking PTY drain (`5b3983e`):** `ttyread()` drains all immediately ready PTY chunks up to 64 KB per wakeup instead of looping through `pselect()` + `XPending()` every 4 KB.
@@ -30,9 +30,10 @@ Starting from commit `5b3983e35510e2c28bd594061eeb4a42d283d92a` through `92d8896
 - **Alt-screen & ring-buffer safety (`5b3983e`, `434ed9f`, `0aada01`):** Alternate-screen scrolls (`tscrollup()`/`tscrolldown()` under `MODE_ALTSCREEN`) no longer allocate or pollute primary scrollback; fixed `ESC M` reverse-index `NULL`-slot crash; clean `CSI 3 J` (`ED 3`) scrollback clearing.
 
 ### 3. Incremental X11 Rendering & Low-Latency Tab Switching
-- **Shadow-buffered incremental renderer `xdrawscreen()` (`5b3983e`, `434ed9f`):** Diffs visible rows via 64-bit hashes against a shadow buffer, shifts scrolled bands server-side via `XCopyArea` (clamped to preserve fixed headers/footers), emits multi-rect dirty blits and intra-row changed spans, batches uniform-bg/same-fg glyph runs and coalesced box-drawing `XRenderFillRectangles()` calls, and caches primary-font ASCII glyph indices.
+- **Shadow-buffered incremental renderer `xdrawscreen()` (`5b3983e`, `434ed9f`, `d8cab1e`):** Diffs visible rows via 64-bit hashes against a shadow buffer, shifts scrolled bands server-side via `XCopyArea` (clamped to preserve fixed headers/footers), diffs intra-row changed spans (`gap >= 16`) without repainting unchanged cells in between, batches background `XRenderFillRectangles()`, foreground `XftDrawGlyphFontSpec()`, and box-drawing segments across the entire frame by color, coalesces local `XCopyArea` blits when `ndirty_rects > 4`, and caches primary-font ASCII glyph indices.
+- **ETX direct-to-window Xft, strip-aligned flushing & space-glyph bridging (`d8cab1e`, `a9a5021`):** On Exceed TurboX (`is_etx && xw.depth < 32`), renders directly onto `xw.win` with zero `XCopyArea` calls — eliminating `etxproxy`'s `ShadowCopyAny -> FlushShadow/_hclPutImage` + 4-thread OpenMP `WalkPrevDrawHash` freeze on `vim` `hlsearch`/`incsearch` and full-screen jumps while keeping full FreeType/Xft anti-aliasing and native ThinX `hclGlyphs`/`hclCompositeRects` forwarding. Flushes complete `(bg + fg)` strips aligned below `libX11`'s 16 KB buffer limit so no `writev()` splits backgrounds from glyphs (preventing blank-background flashes), and bridges `1..8`-cell horizontal gaps between 8-bit same-`fg` glyphs with 0×0-pixel space glyphs (`1 B/cell` vs. 8–12 B `xGlyphElt` headers) to cut `XRenderCompositeGlyphs8` wire bytes by ~21–32% and keep more updates below ETX's 4 KB / 50 ms shadow threshold.
 - **Fallback font deduplication & negative cache (`5b3983e`, `434ed9f`):** Deduplicates `sparefonts` by font file, caches per-rune lookups, skips fontconfig entirely for runes outside `FcFontSort()` union coverage, and skips color-emoji glyphs safely on older `libXft`.
-- **Fast Expose / Focus / Tab switching (`434ed9f`):** `Expose` blits directly from `xw.buf`, `FocusIn`/`FocusOut` and `XEMBED_FOCUS` on 24-bit visuals only dirty the cursor, urgency hints and X11 atoms are cached/batched, and identical window title updates are skipped.
+- **Fast Expose / Focus / Tab switching (`434ed9f`, `d8cab1e`):** `Expose` blits directly from `xw.buf` on local X11 (or invalidates only the exposed rows in `xdirect` mode), `FocusIn`/`FocusOut` and `XEMBED_FOCUS` on 24-bit visuals only dirty the cursor, urgency hints and X11 atoms are cached/batched, and identical window title updates are skipped.
 
 ### 4. Adaptive Refresh Pacing, Remote ETX Guard & Pinned-History Draw Bypass
 - **ETX display auto-detection & backpressure guard (`5b3983e`, `72d0ccf`):** Automatically detects Exceed TurboX (`HCL_ThinX`) at startup to use `etxmaxlatency = 50` ms / `etxxfps = 30` fps (keeping `8 ms` / uncapped on local displays), and skips intermediate frames when `xfd` is not `POLLOUT`-writable instead of blocking in `XFlush()`.
@@ -107,6 +108,16 @@ All measurements below were collected on `Linux 4.18 x86_64` under a private `Xv
 | Refocused / `FocusIn` (1.0 s) | 209 | 209 |
 | Scrolled back in pure history, `term.scr >= term.row` (0.8 s) | **0** | **0** |
 
+#### ETX X11 Wire Traffic (`344×67`, `-DETX=1`, scattered `hlsearch` × 5 + 5 full-screen jumps)
+
+| X11 Wire Metric (`344×67`, `-DETX=1`) | Pre-ETX-fix (`fae35a2`) | Direct + Strip (`d8cab1e`) | + Space Bridging (`a9a5021`) | Total Improvement |
+|---|---:|---:|---:|---:|
+| `CopyArea` -> window (`vim` peak/frame) | 18 (up to 62/fr) | **0** | **0** | **eliminated** |
+| `RenderFillRectangles` requests | 19,613 (550 KB) | 419 (166 KB) | **312 (164 KB)** | **62.9× fewer reqs** |
+| `RenderCompositeGlyphs8` requests | 24,253 (1,442 KB) | 767 (784 KB) | **568 (531 KB)** | **42.7× fewer reqs / 2.7× less B** |
+| Total X11 wire bytes | 2,053 KB | 1,011 KB | **755 KB** | **2.7× less data** |
+| Text `writev()` ending BG-only | 0 | **0** | **0** | flicker-free |
+
 ## Included Base Patches
 
 - `scrollback`, `scrollback-mouse`, `scrollback-clamp`
@@ -153,4 +164,4 @@ tic -sx st.info
 - Original `st` by [suckless.org](https://st.suckless.org/) (based on Aurélien Aptel's `bt`).
 - Performance engineering, diagnosis, benchmarking, and test verification from `5b3983e` onward:
   - **Claude (Claude Opus 5.5)** — initial lag diagnosis & fix (`5b3983e`), incremental `xdrawscreen()` renderer, fallback font caching, and earlier optimization/reliability rounds (`434ed9f`, `af4d9d4`, `72d0ccf`).
-  - **Codex (Gemini 4 Neon)** — generic PTY read-speed `termbench` redesign (`160042f`), compact unified byte-slab scrollback & flood-only direct-to-history fast path (`0aada01`), alt-screen scrollback isolation, unfocused/minimized refresh throttling, and pinned-history draw bypass (`92d8896`).
+  - **Codex (Gemini 4 Neon)** — generic PTY read-speed `termbench` redesign (`160042f`), compact unified byte-slab scrollback & flood-only direct-to-history fast path (`0aada01`), alt-screen scrollback isolation, unfocused/minimized refresh throttling, pinned-history draw bypass (`92d8896`), and ETX direct-to-window strip-aligned XRender batching & 0-pixel space-glyph bridging (`d8cab1e`, `a9a5021`).
