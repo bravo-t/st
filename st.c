@@ -118,13 +118,32 @@ typedef struct {
 } Selection;
 
 /* Internal representation of the screen */
-#define HIST_SLAB_GLYPHS 16384
+#define HIST_SLAB_BYTES 262144
+
+enum hist_fmt {
+	HIST_EMPTY      = 0,
+	HIST_ASCII      = 1, /* raw ASCII bytes (1 B/cell), default fg/bg/mode=0 */
+	HIST_ASCII_WRAP = 2, /* same as HIST_ASCII, with ATTR_WRAP on cell histcol[i]-1 */
+	HIST_SGR_ASCII  = 3, /* packed HistRun headers + raw ASCII bytes */
+	HIST_GLYPH      = 4, /* aligned Glyph[] array */
+};
+
+typedef struct {
+	uint16_t count; /* number of ASCII cells in this run (>= 1) */
+	uint16_t mode;  /* exact Glyph.mode */
+	uint32_t fg;    /* exact Glyph.fg */
+	uint32_t bg;    /* exact Glyph.bg */
+} HistRun;
+
 typedef struct HistSlab {
-	int used;
+	size_t used;
 	int refs;
 	struct HistSlab *prev;
 	struct HistSlab *next;
-	Glyph data[HIST_SLAB_GLYPHS];
+	union {
+		Glyph align_glyph;
+		uchar data[HIST_SLAB_BYTES];
+	} u;
 } HistSlab;
 
 typedef struct {
@@ -136,9 +155,10 @@ typedef struct {
 	int *alt_rowmax;
 	unsigned char *rowwide;     /* 1 if row may contain ATTR_WIDE/ATTR_WDUMMY */
 	unsigned char *alt_rowwide;
-    Line hist[HISTSIZE]; /* history buffer */
+    void *hist[HISTSIZE]; /* history payload (format in histfmt[]) */
     int histcol[HISTSIZE]; /* stored (trimmed) width of each history line */
     HistSlab *histslab[HISTSIZE]; /* slab owning hist[i], or NULL if heap */
+    uchar histfmt[HISTSIZE]; /* enum hist_fmt */
     int histi;           /* history index */
     int scr;             /* history scroll back */
     int histwcount;      /* how many lines have been written */
@@ -234,6 +254,7 @@ static void tstrsequence(uchar);
 static Line thistline(int);
 static Line tvisline(int, Glyph *);
 static void thistclear(void);
+static void thistunpack(int, Glyph *, int);
 
 static void selnormalize(void);
 static void selscroll(int, int);
@@ -265,6 +286,7 @@ static HistSlab *histslab_head = NULL;
 static HistSlab *histslab_cur = NULL;
 static HistSlab *histslab_spare = NULL;
 static int hist_heap_count = 0;
+static uchar hist_empty_line = 0;
 static unsigned int xmode_shadow = 0;
 
 static inline void
@@ -1318,13 +1340,19 @@ kscrollup(const Arg* a)
  *
  * A history line is stored trimmed: only the cells up to its last cell
  * that differs from a default blank, with that width in term.histcol[].
- * The missing tail is recreated on demand with tdefblank() cells, which
- * are indistinguishable from what was trimmed. Two consequences:
- *  - memory and page faults scale with the text, not the window width
- *    (a 110-byte log line was a 5.5 KB row in a 344-column window, and
- *    those page faults were 2/3 of st's CPU time during bulk output);
- *  - tresize() never touches history, so it stays O(rows) however many
- *    of the HISTSIZE lines exist (it used to realloc every one of them).
+ * Plain default-attribute ASCII lines are stored compactly as 1 byte/cell
+ * (HIST_ASCII / HIST_ASCII_WRAP), styled ASCII lines as packed HistRun
+ * attribute runs + raw bytes (HIST_SGR_ASCII, always smaller than Glyph[]),
+ * and non-ASCII/wide/boxdraw lines as aligned Glyph[] (HIST_GLYPH), all
+ * sharing 256 KB refcounted byte slabs.
+ *
+ * Missing trailing blanks are recreated on demand with tdefblank(), and
+ * compact lines are inflated lazily into scratch by tvisline()/externalpipe()
+ * (or materialized by thistline() on selection). Two consequences:
+ *  - memory and page faults scale with compact text (~1 B/char for ASCII
+ *    instead of 16 B/Glyph), cutting bulk flood RSS and page faults ~15x;
+ *  - tresize() never touches history, so it stays O(rows) regardless of
+ *    HISTSIZE.
  */
 static void
 tdefblank(Glyph *g)
@@ -1371,61 +1399,18 @@ histslab_release(HistSlab *s)
 	}
 }
 
-static void
-thistclear(void)
+static void *
+histslab_alloc(size_t nbytes, size_t align, HistSlab **out_slab)
 {
-	HistSlab *s, *next;
-	int i;
+	size_t off;
 
-	if (hist_heap_count > 0) {
-		for (i = 0; i < HISTSIZE; i++) {
-			if (term.hist[i] && !term.histslab[i]) {
-				free(term.hist[i]);
-				term.hist[i] = NULL;
-			}
-		}
-		hist_heap_count = 0;
+	if (nbytes == 0) {
+		*out_slab = NULL;
+		return &hist_empty_line;
 	}
-	for (s = histslab_head; s; s = next) {
-		next = s->next;
-		free(s);
-	}
-	free(histslab_spare);
-	histslab_head = histslab_cur = histslab_spare = NULL;
-	if (term.histwcount > 0) {
-		memset(term.hist, 0, sizeof(term.hist));
-		memset(term.histslab, 0, sizeof(term.histslab));
-		memset(term.histcol, 0, sizeof(term.histcol));
-		term.histwcount = 0;
-		term.histi = 0;
-		if (term.scr > 0) {
-			term.scr = 0;
-			tfulldirt();
-		}
-	}
-}
-
-/* copy a screen line into history slot idx, reusing the slot's memory */
-static void
-thistpush(int idx, const Glyph *line, int maxcol)
-{
-	int len = thistlen(line, maxcol);
-	int need = MAX(len, 1);
-
-	if (term.histslab[idx]) {
-		HistSlab *old = term.histslab[idx];
-		term.histslab[idx] = NULL;
-		term.hist[idx] = NULL;
-		histslab_release(old);
-	} else if (term.hist[idx]) {
-		free(term.hist[idx]);
-		term.hist[idx] = NULL;
-		hist_heap_count--;
-	}
-
-	/* keep at least one cell: a non-NULL slot means "written" */
-	if (need <= HIST_SLAB_GLYPHS) {
-		if (!histslab_cur || histslab_cur->used + need > HIST_SLAB_GLYPHS) {
+	if (nbytes <= HIST_SLAB_BYTES) {
+		off = histslab_cur ? ((histslab_cur->used + align - 1) & ~(align - 1)) : 0;
+		if (!histslab_cur || off + nbytes > HIST_SLAB_BYTES) {
 			if (histslab_cur && histslab_cur->refs == 0) {
 				histslab_cur->used = 0;
 			} else {
@@ -1444,18 +1429,248 @@ thistpush(int idx, const Glyph *line, int maxcol)
 				histslab_head = s;
 				histslab_cur = s;
 			}
+			off = 0;
 		}
-		term.hist[idx] = &histslab_cur->data[histslab_cur->used];
-		histslab_cur->used += need;
+		histslab_cur->used = off + nbytes;
 		histslab_cur->refs++;
-		term.histslab[idx] = histslab_cur;
-	} else {
-		term.hist[idx] = xmalloc((size_t)need * sizeof(Glyph));
-		term.histslab[idx] = NULL;
-		hist_heap_count++;
+		*out_slab = histslab_cur;
+		return &histslab_cur->u.data[off];
 	}
-	memcpy(term.hist[idx], line, len * sizeof(Glyph));
+	*out_slab = NULL;
+	hist_heap_count++;
+	return xmalloc(nbytes);
+}
+
+static void
+thistfree(int idx)
+{
+	if (term.histslab[idx]) {
+		HistSlab *old = term.histslab[idx];
+		term.histslab[idx] = NULL;
+		term.hist[idx] = NULL;
+		histslab_release(old);
+	} else if (term.hist[idx] && term.hist[idx] != &hist_empty_line) {
+		free(term.hist[idx]);
+		term.hist[idx] = NULL;
+		hist_heap_count--;
+	} else {
+		term.hist[idx] = NULL;
+	}
+	term.histcol[idx] = 0;
+	term.histfmt[idx] = HIST_EMPTY;
+}
+
+static void
+thistclear(void)
+{
+	HistSlab *s, *next;
+	int i;
+
+	if (hist_heap_count > 0) {
+		for (i = 0; i < HISTSIZE; i++) {
+			if (term.hist[i] && !term.histslab[i] &&
+			    term.hist[i] != &hist_empty_line) {
+				free(term.hist[i]);
+				term.hist[i] = NULL;
+			}
+		}
+		hist_heap_count = 0;
+	}
+	for (s = histslab_head; s; s = next) {
+		next = s->next;
+		free(s);
+	}
+	free(histslab_spare);
+	histslab_head = histslab_cur = histslab_spare = NULL;
+	if (term.histwcount > 0) {
+		memset(term.hist, 0, sizeof(term.hist));
+		memset(term.histslab, 0, sizeof(term.histslab));
+		memset(term.histcol, 0, sizeof(term.histcol));
+		memset(term.histfmt, 0, sizeof(term.histfmt));
+		term.histwcount = 0;
+		term.histi = 0;
+		if (term.scr > 0) {
+			term.scr = 0;
+			tfulldirt();
+		}
+	}
+}
+
+/* Push a raw plain-ASCII line directly into compact history (1 byte/cell). */
+static void
+thistpush_ascii(int idx, const char *s, int len, int wrapped)
+{
+	uchar *dst;
+
+	if (!wrapped) {
+		while (len > 0 && s[len - 1] == ' ')
+			len--;
+	}
+	thistfree(idx);
+	if (len == 0) {
+		term.hist[idx] = &hist_empty_line;
+		term.histcol[idx] = 0;
+		term.histfmt[idx] = HIST_ASCII;
+		return;
+	}
+	dst = histslab_alloc((size_t)len, 1, &term.histslab[idx]);
+	memcpy(dst, s, (size_t)len);
+	term.hist[idx] = dst;
 	term.histcol[idx] = len;
+	term.histfmt[idx] = wrapped ? HIST_ASCII_WRAP : HIST_ASCII;
+}
+
+/* Push a pre-encoded HIST_SGR_ASCII payload into history slot idx. */
+static void
+thistpush_sgr_packed(int idx, const uchar *packed, size_t nbytes, int cols)
+{
+	uchar *dst;
+
+	thistfree(idx);
+	if (cols == 0) {
+		term.hist[idx] = &hist_empty_line;
+		term.histcol[idx] = 0;
+		term.histfmt[idx] = HIST_ASCII;
+		return;
+	}
+	dst = histslab_alloc(nbytes, 1, &term.histslab[idx]);
+	memcpy(dst, packed, nbytes);
+	term.hist[idx] = dst;
+	term.histcol[idx] = cols;
+	term.histfmt[idx] = HIST_SGR_ASCII;
+}
+
+/* Copy a screen line into history slot idx in the most compact lossless form. */
+static void
+thistpush(int idx, const Glyph *line, int maxcol)
+{
+	int len = thistlen(line, maxcol);
+	uint32_t dfg = seloptsch->defaultfg;
+	uint32_t dbg = seloptsch->defaultbg;
+	int x, plain = 1, ascii_sgr = 1, nruns = 0;
+
+	thistfree(idx);
+	if (len == 0) {
+		term.hist[idx] = &hist_empty_line;
+		term.histcol[idx] = 0;
+		term.histfmt[idx] = HIST_ASCII;
+		return;
+	}
+
+	for (x = 0; x < len; x++) {
+		const Glyph *g = &line[x];
+		if (g->u < 0x20 || g->u > 0x7e ||
+		    (g->mode & (ATTR_WIDE | ATTR_WDUMMY | ATTR_BOXDRAW))) {
+			plain = 0;
+			ascii_sgr = 0;
+			break;
+		}
+		if (plain) {
+			if (g->fg != dfg || g->bg != dbg ||
+			    (g->mode != 0 && !(x == len - 1 && g->mode == ATTR_WRAP)))
+				plain = 0;
+		}
+		if (x == 0 || ATTRCMP(*g, line[x - 1]))
+			nruns++;
+	}
+
+	if (plain) {
+		uchar *dst = histslab_alloc((size_t)len, 1, &term.histslab[idx]);
+		for (x = 0; x < len; x++)
+			dst[x] = (uchar)line[x].u;
+		term.hist[idx] = dst;
+		term.histcol[idx] = len;
+		term.histfmt[idx] = (line[len - 1].mode == ATTR_WRAP) ?
+		                    HIST_ASCII_WRAP : HIST_ASCII;
+		return;
+	}
+
+	if (ascii_sgr) {
+		size_t need = (size_t)nruns * sizeof(HistRun) + (size_t)len;
+		if (need < (size_t)len * sizeof(Glyph)) {
+			uchar *dst = histslab_alloc(need, 1, &term.histslab[idx]);
+			uchar *p = dst;
+			for (x = 0; x < len; ) {
+				int k = 1;
+				HistRun hdr;
+				while (x + k < len && k < 65535 && !ATTRCMP(line[x + k], line[x]))
+					k++;
+				hdr.count = (uint16_t)k;
+				hdr.mode = line[x].mode;
+				hdr.fg = line[x].fg;
+				hdr.bg = line[x].bg;
+				memcpy(p, &hdr, sizeof(hdr));
+				p += sizeof(hdr);
+				for (int j = 0; j < k; j++)
+					p[j] = (uchar)line[x + j].u;
+				p += k;
+				x += k;
+			}
+			term.hist[idx] = dst;
+			term.histcol[idx] = len;
+			term.histfmt[idx] = HIST_SGR_ASCII;
+			return;
+		}
+	}
+
+	Line dst = histslab_alloc((size_t)len * sizeof(Glyph), sizeof(Glyph),
+	                          &term.histslab[idx]);
+	memcpy(dst, line, (size_t)len * sizeof(Glyph));
+	term.hist[idx] = dst;
+	term.histcol[idx] = len;
+	term.histfmt[idx] = HIST_GLYPH;
+}
+
+/* Unpack up to `limit` stored cells of history slot `idx` into `dst`. */
+static void
+thistunpack(int idx, Glyph *dst, int limit)
+{
+	int stored = term.histcol[idx];
+	int w = MIN(stored, limit);
+	uchar fmt = term.histfmt[idx];
+	int x;
+
+	if (w <= 0 || fmt == HIST_EMPTY || !term.hist[idx])
+		return;
+
+	if (fmt == HIST_ASCII || fmt == HIST_ASCII_WRAP) {
+		const uchar *p = (const uchar *)term.hist[idx];
+		Glyph g;
+		tdefblank(&g);
+		for (x = 0; x < w; x++) {
+			dst[x] = g;
+			dst[x].u = p[x];
+		}
+		if (fmt == HIST_ASCII_WRAP && stored <= limit)
+			dst[w - 1].mode |= ATTR_WRAP;
+		return;
+	}
+
+	if (fmt == HIST_SGR_ASCII) {
+		const uchar *p = (const uchar *)term.hist[idx];
+		x = 0;
+		while (x < w) {
+			HistRun hdr;
+			Glyph g;
+			int n, k;
+			memcpy(&hdr, p, sizeof(hdr));
+			p += sizeof(hdr);
+			memset(&g, 0, sizeof(g));
+			g.mode = hdr.mode;
+			g.fg = hdr.fg;
+			g.bg = hdr.bg;
+			n = MIN((int)hdr.count, w - x);
+			for (k = 0; k < n; k++) {
+				dst[x + k] = g;
+				dst[x + k].u = p[k];
+			}
+			p += hdr.count;
+			x += n;
+		}
+		return;
+	}
+
+	memcpy(dst, term.hist[idx], (size_t)w * sizeof(Glyph));
 }
 
 /*
@@ -1467,30 +1682,30 @@ thistpush(int idx, const Glyph *line, int maxcol)
 static Line
 thistline(int idx)
 {
-	Line l = term.hist[idx];
-	int x;
+	int x, stored, newcol;
+	Line nl;
 
-	if (l && term.histcol[idx] < term.col) {
-		if (term.histslab[idx]) {
-			HistSlab *old = term.histslab[idx];
-			Line nl = xmalloc(term.col * sizeof(Glyph));
-			memcpy(nl, l, (size_t)term.histcol[idx] * sizeof(Glyph));
-			term.histslab[idx] = NULL;
-			histslab_release(old);
-			hist_heap_count++;
-			l = nl;
-		} else {
-			l = xrealloc(l, term.col * sizeof(Glyph));
-		}
-		for (x = term.histcol[idx]; x < term.col; x++)
-			tdefblank(&l[x]);
-		term.hist[idx] = l;
-		term.histcol[idx] = term.col;
-	}
-	return l;
+	if (term.histfmt[idx] == HIST_EMPTY || !term.hist[idx])
+		return NULL;
+	if (term.histfmt[idx] == HIST_GLYPH && term.histcol[idx] >= term.col)
+		return (Line)term.hist[idx];
+
+	stored = term.histcol[idx];
+	newcol = MAX(stored, term.col);
+	nl = xmalloc((size_t)newcol * sizeof(Glyph));
+	thistunpack(idx, nl, stored);
+	for (x = stored; x < newcol; x++)
+		tdefblank(&nl[x]);
+	thistfree(idx);
+	term.hist[idx] = nl;
+	term.histslab[idx] = NULL;
+	term.histcol[idx] = newcol;
+	term.histfmt[idx] = HIST_GLYPH;
+	hist_heap_count++;
+	return nl;
 }
 
-/* like TLINE(y), but pads a narrow history line into scratch instead */
+/* like TLINE(y), but unpacks/pads a history line into scratch instead */
 static Line
 tvisline(int y, Glyph *scratch)
 {
@@ -1499,10 +1714,10 @@ tvisline(int y, Glyph *scratch)
 	if (y >= term.scr)
 		return term.line[y - term.scr];
 	idx = (y + term.histi - term.scr + HISTSIZE + 1) % HISTSIZE;
-	w = term.histcol[idx];
-	if (w >= term.col)
-		return term.hist[idx];
-	memcpy(scratch, term.hist[idx], w * sizeof(Glyph));
+	if (term.histfmt[idx] == HIST_GLYPH && term.histcol[idx] >= term.col)
+		return (Line)term.hist[idx];
+	w = MIN(term.histcol[idx], term.col);
+	thistunpack(idx, scratch, w);
 	for (x = w; x < term.col; x++)
 		tdefblank(&scratch[x]);
 	return scratch;
@@ -1515,6 +1730,8 @@ tscrolldown(int orig, int n, int copyhist)
 	Line temp;
 
 	LIMIT(n, 0, term.bot-orig+1);
+	if (IS_SET(MODE_ALTSCREEN))
+		copyhist = 0;
 
 	/*
 	 * Same history effect as the scrollback patch's pointer swap: slot
@@ -1564,6 +1781,8 @@ tscrollup(int orig, int n, int copyhist)
 	Line temp;
 
 	LIMIT(n, 0, term.bot-orig+1);
+	if (IS_SET(MODE_ALTSCREEN))
+		copyhist = 0;
 
 	/* the screen row keeps its buffer; history gets a trimmed copy */
 	if (copyhist) {
@@ -2835,6 +3054,7 @@ externalpipe(const Arg *arg)
    oldsigpipe = signal(SIGPIPE, SIG_IGN);
    newline = 0;
    char *linebuf = xmalloc((size_t)term.col * UTF_SIZ + 2);
+   Glyph *hscratch = xmalloc((size_t)term.col * sizeof(Glyph));
    for (n = 0; n <= HISTSIZE + 2; n++) {
        size_t outlen = 0;
        int w, len, x;
@@ -2846,8 +3066,17 @@ externalpipe(const Arg *arg)
         * re-inflate up to HISTSIZE lines in one go.
         */
        if (n <= HISTSIZE - term.row + 2) {
-           bp = term.hist[n];
-           w = bp ? MIN(term.histcol[n], term.col) : 0;
+           if (term.histfmt[n] == HIST_EMPTY || !term.hist[n]) {
+               bp = NULL;
+               w = 0;
+           } else if (term.histfmt[n] == HIST_GLYPH) {
+               bp = (Line)term.hist[n];
+               w = MIN(term.histcol[n], term.col);
+           } else {
+               w = MIN(term.histcol[n], term.col);
+               thistunpack(n, hscratch, w);
+               bp = hscratch;
+           }
        } else {
            bp = term.line[n - HISTSIZE + term.row - 3];
            w = term.col;
@@ -2878,6 +3107,7 @@ externalpipe(const Arg *arg)
            break;
        newline = 0;
    }
+   free(hscratch);
    free(linebuf);
    if (newline)
        (void)xwrite(to[1], "\n", 1);
@@ -3425,6 +3655,532 @@ check_control_code:
  * Returns the number of bytes consumed; 0 means "use tputc()".
  */
 static int asciifastpath = 1;
+static int bulk_min_bytes = 4096; /* flood threshold: only use twrite_bulk() on >=4KB bursts */
+static long bulk_hits = 0;        /* count of flooded batches handled by twrite_bulk() */
+
+/*
+ * Apply a clean semicolon-separated SGR sequence ("\033[<digits/;>m") to
+ * `attr` without mutating global `term` or printing stderr diagnostics.
+ * Returns 1 on success, or 0 if the sequence uses exotic/unknown syntax
+ * (caller bails out to the general CSI parser).
+ */
+static int
+tsgr_apply_fast(const char *s, int len, Glyph *attr, int *saw_blink)
+{
+	int args[ESC_ARG_SIZ];
+	int narg = 0, i = 0;
+
+	if (len == 0) {
+		args[0] = 0;
+		narg = 1;
+	} else {
+		while (i < len) {
+			int v = 0;
+			if (narg >= ESC_ARG_SIZ)
+				return 0;
+			while (i < len && s[i] >= '0' && s[i] <= '9') {
+				v = v * 10 + (s[i] - '0');
+				if (v > 255)
+					return 0;
+				i++;
+			}
+			args[narg++] = v;
+			if (i < len) {
+				if (s[i] != ';')
+					return 0;
+				i++;
+				if (i == len) {
+					if (narg >= ESC_ARG_SIZ)
+						return 0;
+					args[narg++] = 0;
+				}
+			}
+		}
+	}
+
+	for (i = 0; i < narg; i++) {
+		int a = args[i];
+		switch (a) {
+		case 0:
+			attr->mode &= ~(ATTR_BOLD | ATTR_FAINT | ATTR_ITALIC |
+			                ATTR_UNDERLINE | ATTR_BLINK | ATTR_REVERSE |
+			                ATTR_INVISIBLE | ATTR_STRUCK);
+			attr->fg = seloptsch->defaultfg;
+			attr->bg = seloptsch->defaultbg;
+			break;
+		case 1: attr->mode |= ATTR_BOLD; break;
+		case 2: attr->mode |= ATTR_FAINT; break;
+		case 3: attr->mode |= ATTR_ITALIC; break;
+		case 4: attr->mode |= ATTR_UNDERLINE; break;
+		case 5:
+		case 6:
+			attr->mode |= ATTR_BLINK;
+			if (saw_blink) *saw_blink = 1;
+			break;
+		case 7: attr->mode |= ATTR_REVERSE; break;
+		case 8: attr->mode |= ATTR_INVISIBLE; break;
+		case 9: attr->mode |= ATTR_STRUCK; break;
+		case 22: attr->mode &= ~(ATTR_BOLD | ATTR_FAINT); break;
+		case 23: attr->mode &= ~ATTR_ITALIC; break;
+		case 24: attr->mode &= ~ATTR_UNDERLINE; break;
+		case 25: attr->mode &= ~ATTR_BLINK; break;
+		case 27: attr->mode &= ~ATTR_REVERSE; break;
+		case 28: attr->mode &= ~ATTR_INVISIBLE; break;
+		case 29: attr->mode &= ~ATTR_STRUCK; break;
+		case 38:
+		case 48:
+		case 58:
+			if (i + 1 >= narg)
+				return 0;
+			if (args[i + 1] == 5) {
+				if (i + 2 >= narg)
+					return 0;
+				uint32_t c = (uint32_t)args[i + 2];
+				if (a == 38) attr->fg = c;
+				else if (a == 48) attr->bg = c;
+				i += 2;
+			} else if (args[i + 1] == 2) {
+				if (i + 4 >= narg)
+					return 0;
+				uint32_t c = TRUECOLOR(args[i + 2], args[i + 3], args[i + 4]);
+				if (a == 38) attr->fg = c;
+				else if (a == 48) attr->bg = c;
+				i += 4;
+			} else {
+				return 0;
+			}
+			break;
+		case 39: attr->fg = seloptsch->defaultfg; break;
+		case 49: attr->bg = seloptsch->defaultbg; break;
+		case 59: break;
+		default:
+			if (BETWEEN(a, 30, 37))
+				attr->fg = (uint32_t)(a - 30);
+			else if (BETWEEN(a, 40, 47))
+				attr->bg = (uint32_t)(a - 40);
+			else if (BETWEEN(a, 90, 97))
+				attr->fg = (uint32_t)(a - 90 + 8);
+			else if (BETWEEN(a, 100, 107))
+				attr->bg = (uint32_t)(a - 100 + 8);
+			else
+				return 0;
+			break;
+		}
+	}
+	return 1;
+}
+
+/* Encode a validated SGR+ASCII line directly from PTY bytes into compact history. */
+static void
+thistpush_sgr_raw(int idx, const char *s, int raw_len, int cols, int wrapped,
+                  Glyph attr)
+{
+	static uchar *pbuf = NULL;
+	static size_t pcap = 0;
+	size_t max_need = (size_t)cols * (sizeof(HistRun) + 1) + sizeof(HistRun) + 4;
+	uint32_t dfg = seloptsch->defaultfg;
+	uint32_t dbg = seloptsch->defaultbg;
+	uchar *p;
+	int pos = 0, out_cols = 0;
+	size_t last_hdr_off = (size_t)-1;
+	HistRun last_hdr;
+
+	if (cols == 0) {
+		thistpush_sgr_packed(idx, NULL, 0, 0);
+		return;
+	}
+	if (max_need > pcap) {
+		pcap = MAX(max_need, 8192);
+		pbuf = xrealloc(pbuf, pcap);
+	}
+	p = pbuf;
+	memset(&last_hdr, 0, sizeof(last_hdr));
+
+	while (pos < raw_len) {
+		uchar b = (uchar)s[pos];
+		if (b == '\033') {
+			int j = pos + 2;
+			if (j < raw_len && s[j] == 'K') {
+				pos = j + 1;
+				continue;
+			}
+			if (j + 1 < raw_len && s[j] == '0' && s[j + 1] == 'K') {
+				pos = j + 2;
+				continue;
+			}
+			while (j < raw_len && s[j] != 'm')
+				j++;
+			tsgr_apply_fast(s + pos + 2, j - (pos + 2), &attr, NULL);
+			pos = j + 1;
+			continue;
+		}
+		int rstart = pos;
+		while (pos < raw_len && (uchar)s[pos] >= 0x20 && (uchar)s[pos] <= 0x7e)
+			pos++;
+		int rlen = pos - rstart;
+		if (rlen <= 0)
+			continue;
+
+		/* Merge with previous run if attributes match (e.g. redundant SGR). */
+		if (last_hdr_off != (size_t)-1 &&
+		    last_hdr.mode == attr.mode && last_hdr.fg == attr.fg &&
+		    last_hdr.bg == attr.bg && (int)last_hdr.count + rlen <= 65535) {
+			last_hdr.count = (uint16_t)(last_hdr.count + rlen);
+			memcpy(pbuf + last_hdr_off, &last_hdr, sizeof(last_hdr));
+			memcpy(p, s + rstart, (size_t)rlen);
+			p += rlen;
+			out_cols += rlen;
+		} else {
+			int off = 0;
+			while (off < rlen) {
+				int chunk = MIN(rlen - off, 65535);
+				last_hdr_off = (size_t)(p - pbuf);
+				last_hdr.count = (uint16_t)chunk;
+				last_hdr.mode = attr.mode;
+				last_hdr.fg = attr.fg;
+				last_hdr.bg = attr.bg;
+				memcpy(p, &last_hdr, sizeof(last_hdr));
+				p += sizeof(last_hdr);
+				memcpy(p, s + rstart + off, (size_t)chunk);
+				p += chunk;
+				out_cols += chunk;
+				off += chunk;
+			}
+		}
+	}
+
+	/*
+	 * Trim trailing default-blank spaces (matching thistlen()) when not wrapped.
+	 * Because adjacent identical runs were merged above, default-blank runs at
+	 * the tail can only span the final run.
+	 */
+	if (!wrapped && last_hdr_off != (size_t)-1 &&
+	    last_hdr.mode == 0 && last_hdr.fg == dfg && last_hdr.bg == dbg) {
+		int trim = 0;
+		uchar *run_bytes = pbuf + last_hdr_off + sizeof(HistRun);
+		while (trim < (int)last_hdr.count &&
+		       run_bytes[last_hdr.count - 1 - trim] == ' ')
+			trim++;
+		if (trim > 0) {
+			out_cols -= trim;
+			p -= trim;
+			if (trim == (int)last_hdr.count) {
+				p = pbuf + last_hdr_off;
+				last_hdr_off = (size_t)-1;
+			} else {
+				last_hdr.count = (uint16_t)(last_hdr.count - trim);
+				memcpy(pbuf + last_hdr_off, &last_hdr, sizeof(last_hdr));
+			}
+		}
+	}
+
+	if (out_cols == 0) {
+		thistpush_sgr_packed(idx, NULL, 0, 0);
+		return;
+	}
+
+	/* If wrapped, only the final cell carries ATTR_WRAP. */
+	if (wrapped && last_hdr_off != (size_t)-1) {
+		if (last_hdr.count == 1) {
+			last_hdr.mode |= ATTR_WRAP;
+			memcpy(pbuf + last_hdr_off, &last_hdr, sizeof(last_hdr));
+		} else {
+			uchar last_ch = p[-1];
+			HistRun whdr = last_hdr;
+			last_hdr.count--;
+			memcpy(pbuf + last_hdr_off, &last_hdr, sizeof(last_hdr));
+			p--;
+			whdr.count = 1;
+			whdr.mode |= ATTR_WRAP;
+			memcpy(p, &whdr, sizeof(whdr));
+			p += sizeof(whdr);
+			*p++ = last_ch;
+		}
+	}
+
+	/* If only one default-attr run remains, store as HIST_ASCII (1 B/cell). */
+	if (last_hdr_off == 0 && last_hdr.fg == dfg && last_hdr.bg == dbg &&
+	    (last_hdr.mode == 0 || (last_hdr.count == 1 && last_hdr.mode == ATTR_WRAP))) {
+		thistpush_ascii(idx, (const char *)(pbuf + sizeof(HistRun)), out_cols,
+		                (last_hdr.mode & ATTR_WRAP) != 0);
+		return;
+	}
+
+	thistpush_sgr_packed(idx, pbuf, (size_t)(p - pbuf), out_cols);
+}
+
+/* Render a validated BulkLine directly onto visible screen row `y`. */
+static void
+twrite_bulk_render_row(int y, const char *s, int raw_len, int cols,
+                       int is_sgr, int wrapped, Glyph attr)
+{
+	Line line = term.line[y];
+	int prev_rm = MIN(term.rowmax[y], term.col);
+	Glyph blank;
+	int x;
+
+	tdefblank(&blank);
+	if (!is_sgr) {
+		for (x = 0; x < cols; x++) {
+			line[x] = blank;
+			line[x].u = (uchar)s[x];
+		}
+	} else {
+		int pos = 0;
+		x = 0;
+		while (pos < raw_len && x < term.col) {
+			uchar b = (uchar)s[pos];
+			if (b == '\033') {
+				int j = pos + 2;
+				if (j < raw_len && s[j] == 'K') {
+					pos = j + 1;
+					continue;
+				}
+				if (j + 1 < raw_len && s[j] == '0' && s[j + 1] == 'K') {
+					pos = j + 2;
+					continue;
+				}
+				while (j < raw_len && s[j] != 'm')
+					j++;
+				tsgr_apply_fast(s + pos + 2, j - (pos + 2), &attr, NULL);
+				pos = j + 1;
+				continue;
+			}
+			Glyph g;
+			memset(&g, 0, sizeof(g));
+			g.mode = attr.mode;
+			g.fg = attr.fg;
+			g.bg = attr.bg;
+			while (pos < raw_len && x < term.col &&
+			       (uchar)s[pos] >= 0x20 && (uchar)s[pos] <= 0x7e) {
+				line[x] = g;
+				line[x].u = (uchar)s[pos++];
+				x++;
+			}
+		}
+	}
+	if (wrapped && cols > 0)
+		line[cols - 1].mode |= ATTR_WRAP;
+	for (x = cols; x < prev_rm; x++)
+		line[x] = blank;
+	term.rowmax[y] = cols;
+	term.rowwide[y] = 0;
+}
+
+#define BULK_MAX_LINES 2048
+typedef struct {
+	int off;
+	int raw_len;
+	int cols;
+	uchar is_sgr;
+	uchar wrapped;
+	uchar last_ch;
+	Glyph start_attr;
+} BulkLine;
+
+/*
+ * Direct-to-history bulk fast path for scrolling floods (plain ASCII and
+ * semicolon-separated SGR ASCII, including soft-wrapped lines).
+ *
+ * Enabled only under flooded conditions: incoming buffer >= bulk_min_bytes
+ * AND at least `term.row` complete lines arrive while the cursor is at
+ * (0, term.bot) on a clean full-screen scroll region. Overflow lines go
+ * straight into compact history (or are skipped on alt screen) without
+ * rotating term.line[], calling tclearregion(), or expanding to 16-byte
+ * Glyphs; only the final `term.row - 1` visible rows are rendered onto screen.
+ *
+ * Returns bytes consumed (>= 0); 0 means "use normal twrite() path".
+ */
+static int
+twrite_bulk(const char *s, int len, int *fail_off)
+{
+	static BulkLine blines[BULK_MAX_LINES];
+
+	uint32_t dfg = seloptsch->defaultfg;
+	uint32_t dbg = seloptsch->defaultbg;
+	int col = term.col;
+	int rows = term.row;
+	int crlf = IS_SET(MODE_CRLF);
+	int wrap = IS_SET(MODE_WRAP);
+	Glyph cur_attr = term.c.attr;
+	int saw_blink = 0;
+	int pos = 0, k = 0;
+	int max_pos = 0;
+
+	/* Quick check: a flood of lines must contain a newline early in the buffer. */
+	if (!memchr(s, '\n', (size_t)MIN(len, 4096))) {
+		if (fail_off) *fail_off = MIN(len, 4096);
+		return 0;
+	}
+
+	while (pos < len && k < BULK_MAX_LINES) {
+		int lstart = pos;
+		int lcols = 0;
+		Glyph line_start_attr = cur_attr;
+		int line_sgr = (cur_attr.mode != 0 || cur_attr.fg != dfg || cur_attr.bg != dbg);
+		int line_blink = 0;
+		uchar last_ch = 0;
+		int ok_line = 0;
+		int wrapped = 0;
+		int raw_end = pos;
+
+		for (;;) {
+			if (pos >= len)
+				break;
+			uchar b = (uchar)s[pos];
+			if (b >= 0x20 && b <= 0x7e) {
+				if (lcols == col) {
+					/*
+					 * Soft-wrap on next printable char: valid only when
+					 * MODE_WRAP is on and cur_attr has default fg/bg so
+					 * tscrollup()'s tclearregion() produces a default-blank row.
+					 */
+					if (wrap && cur_attr.fg == dfg && cur_attr.bg == dbg) {
+						raw_end = pos;
+						wrapped = 1;
+						ok_line = 1;
+					}
+					break;
+				}
+				int lim = MIN(len - pos, col - lcols);
+				int run = 0;
+				while (run < lim) {
+					uchar c = (uchar)s[pos + run];
+					if (c < 0x20 || c > 0x7e)
+						break;
+					run++;
+				}
+				pos += run;
+				lcols += run;
+				last_ch = (uchar)s[pos - 1];
+				continue;
+			}
+			if (b == '\r' && pos + 1 < len && s[pos + 1] == '\n') {
+				if (cur_attr.fg == dfg && cur_attr.bg == dbg) {
+					raw_end = pos;
+					pos += 2;
+					ok_line = 1;
+				}
+				break;
+			}
+			if (b == '\n' && (crlf || lcols == 0)) {
+				if (cur_attr.fg == dfg && cur_attr.bg == dbg) {
+					raw_end = pos;
+					pos += 1;
+					ok_line = 1;
+				}
+				break;
+			}
+			if (b == '\033' && pos + 2 < len && s[pos + 1] == '[' && lcols < col) {
+				int j = pos + 2;
+				/* EL 0 (\033[K or \033[0K) on a clean row with default fg/bg is a no-op. */
+				if (cur_attr.fg == dfg && cur_attr.bg == dbg) {
+					if (s[j] == 'K') {
+						line_sgr = 1;
+						pos = j + 1;
+						continue;
+					}
+					if (s[j] == '0' && j + 1 < len && s[j + 1] == 'K') {
+						line_sgr = 1;
+						pos = j + 2;
+						continue;
+					}
+				}
+				int cap = MIN(len, pos + 2 + ESC_BUF_SIZ - 1);
+				while (j < cap && ((s[j] >= '0' && s[j] <= '9') || s[j] == ';'))
+					j++;
+				if (j < cap && s[j] == 'm') {
+					Glyph next_attr = cur_attr;
+					if (tsgr_apply_fast(s + pos + 2, j - (pos + 2),
+					                    &next_attr, &line_blink)) {
+						cur_attr = next_attr;
+						line_sgr = 1;
+						pos = j + 1;
+						continue;
+					}
+				}
+			}
+			break;
+		}
+
+		if (!ok_line) {
+			/* Roll back partial line state so normal twrite() handles it exactly. */
+			if (pos > max_pos) max_pos = pos;
+			cur_attr = line_start_attr;
+			pos = lstart;
+			break;
+		}
+		if (pos > max_pos) max_pos = pos;
+
+		if (line_blink)
+			saw_blink = 1;
+		blines[k].off = lstart;
+		blines[k].raw_len = raw_end - lstart;
+		blines[k].cols = lcols;
+		blines[k].is_sgr = (uchar)line_sgr;
+		blines[k].wrapped = (uchar)wrapped;
+		blines[k].last_ch = last_ch;
+		blines[k].start_attr = line_start_attr;
+		k++;
+	}
+
+	/* Stay disabled under normal output; only engage when lines overflow the window. */
+	if (k < rows || k < 2) {
+		if (fail_off) *fail_off = max_pos;
+		return 0;
+	}
+	bulk_hits++;
+
+	int vis = rows - 1;
+	int alt = IS_SET(MODE_ALTSCREEN);
+
+	/* Step 1: Push scrolled-off lines directly to compact history (skip on alt screen). */
+	if (!alt) {
+		int skip = (k > HISTSIZE) ? (k - HISTSIZE) : 0;
+		if (skip > 0) {
+			term.histi = (term.histi + skip) % HISTSIZE;
+			term.histwcount = HISTSIZE;
+		}
+		for (int i = skip; i < k; i++) {
+			term.histi = (term.histi + 1) % HISTSIZE;
+			if (i < vis) {
+				thistpush(term.histi, term.line[i], term.rowmax[i]);
+			} else {
+				const BulkLine *bl = &blines[i - vis];
+				if (!bl->is_sgr) {
+					thistpush_ascii(term.histi, s + bl->off, bl->raw_len, bl->wrapped);
+				} else {
+					thistpush_sgr_raw(term.histi, s + bl->off, bl->raw_len,
+					                  bl->cols, bl->wrapped, bl->start_attr);
+				}
+			}
+			if (term.histwcount < HISTSIZE)
+				term.histwcount++;
+		}
+		if (term.scr > 0 && term.scr < HISTSIZE)
+			term.scr = MIN(term.scr + k, MIN(term.histwcount, HISTSIZE - 1));
+	}
+
+	/* Step 2: Populate ONLY the final visible screen rows (k >= rows > vis). */
+	if (vis > 0) {
+		int first = k - vis;
+		for (int y = 0; y < vis; y++) {
+			const BulkLine *bl = &blines[first + y];
+			twrite_bulk_render_row(y, s + bl->off, bl->raw_len, bl->cols,
+			                       bl->is_sgr, bl->wrapped, bl->start_attr);
+		}
+	}
+
+	tsetdirt(0, rows - 1);
+	term.c.attr = cur_attr;
+	if (saw_blink)
+		term.has_blink = 1;
+	term.c.x = 0;
+	term.c.y = term.bot;
+	term.c.state &= ~CURSOR_WRAPNEXT;
+	term.lastc = blines[k - 1].wrapped ? blines[k - 1].last_ch : 0;
+	return pos;
+}
 
 static int
 tputascii(const char *s, int len)
@@ -3580,6 +4336,8 @@ twrite(const char *buf, int buflen, int show_ctrl)
 	int charsize, k;
 	Rune u;
 	int n;
+	int bulk_retry_at = (buflen >= bulk_min_bytes) ? 0 : buflen;
+	int bulk_fails = 0;
 
 	int su0 = su;
 	twrite_aborted = 0;
@@ -3598,6 +4356,26 @@ twrite(const char *buf, int buflen, int show_ctrl)
 		 */
 		if (asciifastpath && !term.esc && !show_ctrl && !IS_SET(MODE_PRINT)) {
 			uchar b = (uchar)buf[n];
+			if (n >= bulk_retry_at && term.c.y == term.bot && term.c.x == 0 &&
+			    buflen - n >= bulk_min_bytes &&
+			    !(term.mode & MODE_INSERT) &&
+			    term.trantbl[term.charset] != CS_GRAPHIC0 &&
+			    sel.ob.x == -1 && term.top == 0 && term.bot == term.row - 1 &&
+			    !(term.c.state & CURSOR_WRAPNEXT) && term.rowmax[term.bot] == 0 &&
+			    term.c.attr.fg == seloptsch->defaultfg &&
+			    term.c.attr.bg == seloptsch->defaultbg &&
+			    ((b >= 0x20 && b <= 0x7e) || b == '\033' || b == '\r' || b == '\n')) {
+				int fail_off = 0;
+				if ((k = twrite_bulk(buf + n, buflen - n, &fail_off))) {
+					bulk_fails = 0;
+					charsize = k;
+					continue;
+				}
+				if (++bulk_fails >= 2)
+					bulk_retry_at = buflen;
+				else
+					bulk_retry_at = n + fail_off + 1;
+			}
 			if (b >= 0x20 && b < 0x7f) {
 				if ((k = tputascii(buf + n, buflen - n))) {
 					charsize = k;

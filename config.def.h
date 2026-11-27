@@ -106,6 +106,16 @@ static double etxmaxlatency = 50;
 static unsigned int etxxfps = 30;
 
 /*
+ * Reduced refresh pacing when the window loses focus (still visible) or is
+ * minimized/hidden/fully obscured (!MODE_VISIBLE). Full maxlatency/xfps is
+ * restored immediately when focus and visibility return.
+ */
+static double unfocusedmaxlatency = 100;
+static unsigned int unfocusedxfps = 10;
+static double hiddenmaxlatency = 250;
+static unsigned int hiddenxfps = 4;
+
+/*
  * blinking timeout (set to 0 to disable blinking) for the terminal blinking
  * attribute.
  */

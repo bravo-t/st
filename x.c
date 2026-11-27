@@ -302,6 +302,7 @@ static int prev_cx = 0;
 static int prev_cy = 0;
 static int cursor_dirty = 0;
 static int xneeddraw = 0;
+static int xresetdrawthrottle = 0;
 static int win_urgent = 0;
 static int is_etx = 0;
 static int dirty_x1 = 0, dirty_y1 = 0, dirty_x2 = 0, dirty_y2 = 0;
@@ -3099,8 +3100,10 @@ visibility(XEvent *ev)
 	int was_visible = IS_SET(MODE_VISIBLE);
 
 	MODBIT(win.mode, e->state != VisibilityFullyObscured, MODE_VISIBLE);
-	if (!was_visible && IS_SET(MODE_VISIBLE))
+	if (!was_visible && IS_SET(MODE_VISIBLE)) {
+		xresetdrawthrottle = 1;
 		xneeddraw = 1;
+	}
 }
 
 void
@@ -3185,6 +3188,7 @@ focus(XEvent *ev)
 			ttywrite("\033[I", 3, 0);
         if (!focused) {
             focused = true;
+            xresetdrawthrottle = 1;
             if (xw.depth == 32 && alpha != alpha_unfocused) {
                 xloadalpha();
                 xinvalidatedrawn();
@@ -3334,11 +3338,16 @@ cmessage(XEvent *e)
 	if (e->xclient.message_type == xw.xembed && e->xclient.format == 32) {
 		if (e->xclient.data.l[1] == XEMBED_FOCUS_IN) {
 			win.mode |= MODE_FOCUSED;
+			if (!focused) {
+				focused = true;
+				xresetdrawthrottle = 1;
+			}
 			xseturgency(0);
 			cursor_dirty = 1;
 			xneeddraw = 1;
 		} else if (e->xclient.data.l[1] == XEMBED_FOCUS_OUT) {
 			win.mode &= ~MODE_FOCUSED;
+			focused = false;
 			cursor_dirty = 1;
 			xneeddraw = 1;
 		}
@@ -3360,6 +3369,33 @@ resize(XEvent *e)
 
 int tinsync(uint);
 int ttyread_pending();
+
+/*
+ * Compute effective draw pacing for the current window state:
+ *  - minimized/unmapped/fully obscured (!MODE_VISIBLE): hiddenmaxlatency / hiddenxfps
+ *  - visible but unfocused (!focused):                  unfocusedmaxlatency / unfocusedxfps
+ *  - focused & visible:                                 configured maxlatency / xfps
+ */
+static void
+xactivepacing(double *out_maxlat, unsigned int *out_xfps)
+{
+	double ml = maxlatency;
+	unsigned int fps = xfps;
+
+	if (!IS_SET(MODE_VISIBLE)) {
+		if (hiddenmaxlatency > ml)
+			ml = hiddenmaxlatency;
+		if (hiddenxfps && (!fps || hiddenxfps < fps))
+			fps = hiddenxfps;
+	} else if (!focused) {
+		if (unfocusedmaxlatency > ml)
+			ml = unfocusedmaxlatency;
+		if (unfocusedxfps && (!fps || unfocusedxfps < fps))
+			fps = unfocusedxfps;
+	}
+	*out_maxlat = ml;
+	*out_xfps = fps;
+}
 
 void
 run(void)
@@ -3439,6 +3475,13 @@ run(void)
 		}
 		xev = xneeddraw;
 		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (xresetdrawthrottle) {
+			lastdraw = (struct timespec){0};
+			xresetdrawthrottle = 0;
+		}
+		double eff_maxlat;
+		unsigned int eff_xfps;
+		xactivepacing(&eff_maxlat, &eff_xfps);
 
 		/*
 		 * To reduce flicker and tearing, when new content or event
@@ -3462,8 +3505,8 @@ run(void)
 				trigger = now;
 				drawing = 1;
 			}
-			timeout = (maxlatency - TIMEDIFF(now, trigger)) \
-			          / maxlatency * minlatency;
+			timeout = (eff_maxlat - TIMEDIFF(now, trigger)) \
+			          / eff_maxlat * minlatency;
 			if (timeout > 0)
 				continue;  /* we have time, try to find idle */
 		}
@@ -3492,8 +3535,8 @@ run(void)
 		 * otherwise ask for one frame per event. This delays a frame by
 		 * at most 1000/xfps ms, and only when frames come back to back.
 		 */
-		if (xfps && TIMEDIFF(now, lastdraw) < 1000.0 / xfps) {
-			timeout = 1000.0 / xfps - TIMEDIFF(now, lastdraw);
+		if (eff_xfps && TIMEDIFF(now, lastdraw) < 1000.0 / eff_xfps) {
+			timeout = 1000.0 / eff_xfps - TIMEDIFF(now, lastdraw);
 			continue;
 		}
 
