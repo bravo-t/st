@@ -144,6 +144,8 @@ typedef struct {
 	FcCharSet *setcs; /* union coverage of set, from FcFontSort() */
 	FcPattern *pattern;
 	FT_UInt ascii[128]; /* precomputed glyph indices for ASCII 0x20..0x7e */
+	FT_UInt space_glyph; /* 0-pixel space glyph for bridging short XRender gaps */
+	int space_xoff;      /* advance width of space_glyph */
 } Font;
 
 /* Drawing Context */
@@ -1263,6 +1265,16 @@ xloadfont(Font *f, FcPattern *pattern)
 	memset(f->ascii, 0, sizeof(f->ascii));
 	for (int c = 0x20; c < 0x7f; c++)
 		f->ascii[c] = XftCharIndex(xw.dpy, f->match, (FcChar32)c);
+	f->space_glyph = 0;
+	f->space_xoff = 0;
+	if (f->ascii[' '] && f->ascii[' '] < 256) {
+		XGlyphInfo spext;
+		XftGlyphExtents(xw.dpy, f->match, &f->ascii[' '], 1, &spext);
+		if (spext.width == 0 && spext.height == 0 && spext.xOff > 0) {
+			f->space_glyph = f->ascii[' '];
+			f->space_xoff = spext.xOff;
+		}
+	}
 
 	return 0;
 }
@@ -2931,6 +2943,21 @@ xdirect_flush_strip(void)
 	xdirect_buf_est += est;
 }
 
+/* Return 0-pixel space glyph ID for `xf` if its advance equals win.cw, else 0. */
+static inline FT_UInt
+xbridge_space_glyph(const XftFont *xf)
+{
+	if (xf == dc.font.match)
+		return (dc.font.space_xoff == win.cw) ? dc.font.space_glyph : 0;
+	if (xf == dc.bfont.match)
+		return (dc.bfont.space_xoff == win.cw) ? dc.bfont.space_glyph : 0;
+	if (xf == dc.ifont.match)
+		return (dc.ifont.space_xoff == win.cw) ? dc.ifont.space_glyph : 0;
+	if (xf == dc.ibfont.match)
+		return (dc.ibfont.space_xoff == win.cw) ? dc.ibfont.space_glyph : 0;
+	return 0;
+}
+
 void
 xdrawline(Line line, int x1, int y1, int x2)
 {
@@ -3180,13 +3207,42 @@ xdrawline(Line line, int x1, int y1, int x2)
 				}
 				if (xfg_cnt[fi] > 0) {
 					const XftGlyphFontSpec *prev = &xfg_specs[fi][xfg_cnt[fi] - 1];
+					int dx = specs[specidx].x - prev->x;
 					if (prev->font == specs[specidx].font &&
 					    prev->y == specs[specidx].y &&
-					    specs[specidx].x >= prev->x &&
-					    specs[specidx].x <= prev->x + 2 * win.cw)
-						xfg_wire[fi] += 2;
-					else
+					    dx == win.cw) {
+						xfg_wire[fi] += (specs[specidx].glyph < 256) ? 1 : 2;
+					} else if (xdirect &&
+					           prev->font == specs[specidx].font &&
+					           prev->y == specs[specidx].y &&
+					           prev->glyph < 256 && specs[specidx].glyph < 256 &&
+					           dx > win.cw && dx <= 9 * win.cw &&
+					           (dx % win.cw) == 0) {
+						/*
+						 * Bridge 1..8 cell gaps with 0x0 space glyphs (1 B/cell)
+						 * instead of starting a new 8-12 B xGlyphElt header in
+						 * XRenderCompositeGlyphs8. Draws 0 pixels, so it safely
+						 * bridges across both spaces and cells of other fg colors.
+						 */
+						int gap = (dx / win.cw) - 1;
+						FT_UInt spg = xbridge_space_glyph(specs[specidx].font);
+						if (spg && xfg_cnt[fi] + gap + 1 <= FG_SPEC_BATCH) {
+							short px = prev->x;
+							short py = prev->y;
+							for (int k = 1; k <= gap; k++) {
+								xfg_specs[fi][xfg_cnt[fi]].font = specs[specidx].font;
+								xfg_specs[fi][xfg_cnt[fi]].glyph = spg;
+								xfg_specs[fi][xfg_cnt[fi]].x = (short)(px + k * win.cw);
+								xfg_specs[fi][xfg_cnt[fi]].y = py;
+								xfg_cnt[fi]++;
+							}
+							xfg_wire[fi] += (size_t)gap + 1;
+						} else {
+							xfg_wire[fi] += 12;
+						}
+					} else {
 						xfg_wire[fi] += 12;
+					}
 				} else {
 					xfg_wire[fi] += 12;
 				}
